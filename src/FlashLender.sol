@@ -4,13 +4,13 @@ pragma solidity ^0.8.0;
 import "openzeppelin-contracts/contracts/interfaces/IERC3156FlashBorrower.sol";
 import "openzeppelin-contracts/contracts/interfaces/IERC20.sol";
 import "openzeppelin-contracts/contracts/interfaces/IERC3156FlashLender.sol";
-import "./InsurancePool.sol";
+import "./InsurancePoolManager.sol";
 
 
 contract FlashLender is IERC3156FlashLender {
 
     bytes32 public constant CALLBACK_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
-    InsurancePool public insurancePool;
+    InsurancePoolManager public insurancePoolManager;
 
     uint256 public fee; // Fee percentage in basis points (bps)
 
@@ -21,11 +21,11 @@ contract FlashLender is IERC3156FlashLender {
     error UnsupportedToken(address token);
 
     /**
-     * @param insurancePool_ The address of the InsurancePool contract.
+     * @param insurancePool_ The address of the InsurancePoolManager contract.
      * @param fee_ The percentage of the loan `amount` that needs to be repaid, in addition to `amount`.
      */
-    constructor(address insurancePool_, uint256 fee_) {
-        insurancePool = InsurancePool(insurancePool_);
+    constructor(address InsurancePoolManager, uint256 fee_) {
+        insurancePoolManager = InsurancePoolManager(InsurancePoolManager);
         fee = fee_;
     }
 
@@ -45,7 +45,7 @@ contract FlashLender is IERC3156FlashLender {
         uint256 loanFee = _flashFee(token, amount);
 
         // Transfer tokens from the InsurancePool
-        if (!insurancePool.transferFunds(token, address(receiver), amount)) {
+        if (!insurancePoolManager.transferFunds(token, address(receiver), amount)) {
             revert TransferFailed(token, address(receiver), amount);
         }
 
@@ -62,12 +62,14 @@ contract FlashLender is IERC3156FlashLender {
         if (
             !IERC20(token).transferFrom(
                 address(receiver),
-                address(insurancePool),
+                address(insurancePoolManager),
                 totalRepayment
             )
         ) {
             revert RepaymentFailed(token, address(receiver), totalRepayment);
         }
+
+        insurancePoolManager.Repayment(token, amount, loanFee);       
 
         return true;
     }
