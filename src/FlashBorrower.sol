@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "openzeppelin-contracts/contracts/interfaces/IERC3156FlashBorrower.sol";
-import "openzeppelin-contracts/contracts/interfaces/IERC20.sol";
-import "openzeppelin-contracts/contracts/interfaces/IERC3156FlashLender.sol";
+import "@openzeppelin/contracts/interfaces/IERC3156FlashBorrower.sol";
+import "@openzeppelin/contracts/interfaces/IERC20.sol";
+import "@openzeppelin/contracts/interfaces/IERC3156FlashLender.sol";
 
 /**
  * @title FlashBorrower
  * @dev Example implementation of the ERC-3156 Flash Borrower interface.
  */
 contract FlashBorrower is IERC3156FlashBorrower {
-    enum Action {NORMAL, OTHER}
+    enum Action {
+        NORMAL,
+        OTHER
+    }
 
     IERC3156FlashLender public lender;
 
-    
     error UntrustedLender(address lender);
     error UntrustedInitiator(address initiator);
 
@@ -35,13 +37,11 @@ contract FlashBorrower is IERC3156FlashBorrower {
      * @param data Arbitrary data structure, intended to contain user-defined parameters.
      * @return The keccak256 hash of "ERC3156FlashBorrower.onFlashLoan".
      */
-    function onFlashLoan(
-        address initiator,
-        address token,
-        uint256 amount,
-        uint256 fee,
-        bytes calldata data
-    ) external override returns (bytes32) {
+    function onFlashLoan(address initiator, address token, uint256 amount, uint256 fee, bytes calldata data)
+        external
+        override
+        returns (bytes32)
+    {
         // Verify the lender
         if (msg.sender != address(lender)) {
             revert UntrustedLender(msg.sender);

@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "openzeppelin-contracts/contracts/interfaces/IERC20.sol";
+import "@openzeppelin/contracts/interfaces/IERC20.sol";
 
 contract InsurancePoolManager {
-
     address public flashLoanContract;
 
     modifier onlyFlashLoanContract() {
@@ -34,19 +33,15 @@ contract InsurancePoolManager {
     // Array to store pool addresses for efficient iteration (for distributing flashloanfees across pools)
     address[] public poolList;
 
-    constructor (address _flashLoanContract) {
+    constructor(address _flashLoanContract) {
         flashLoanContract = _flashLoanContract;
     }
 
     // ** Update LP Liquidity **
     //Gets updated when lp adds or remove liquidity through hook's afterAddLiquidity and afterRemoveLiquidity function
-    function updateLPLiquidity(
-        address poolid,
-        address lp,
-        uint256 amountToken0,
-        uint256 amountToken1,
-        bool isAdding
-    ) external {
+    function updateLPLiquidity(address poolid, address lp, uint256 amountToken0, uint256 amountToken1, bool isAdding)
+        external
+    {
         PoolData storage poolData = pools[poolid];
 
         if (isAdding) {
@@ -56,8 +51,7 @@ contract InsurancePoolManager {
             poolData.totalLiquidityToken1 += amountToken1;
         } else {
             require(
-                poolData.lpLiquidityToken0[lp] >= amountToken0 &&
-                poolData.lpLiquidityToken1[lp] >= amountToken1,
+                poolData.lpLiquidityToken0[lp] >= amountToken0 && poolData.lpLiquidityToken1[lp] >= amountToken1,
                 "Insufficient LP liquidity"
             );
             poolData.lpLiquidityToken0[lp] -= amountToken0;
@@ -68,11 +62,7 @@ contract InsurancePoolManager {
     }
 
     // ** Allocate SwapFees to Pool and Tokens through beforeswap function from hook**
-    function allocateFeesToPool(
-        address poolid,
-        address feeToken,
-        uint256 feeAmount
-    ) external {
+    function allocateFeesToPool(address poolid, address feeToken, uint256 feeAmount) external {
         PoolData storage poolData = pools[poolid];
         TokenData storage tokenData = tokens[feeToken];
 
@@ -81,8 +71,7 @@ contract InsurancePoolManager {
             poolData.totalContributionsToken0 += feeAmount;
         } else if (feeToken == poolData.token1) {
             poolData.totalContributionsToken1 += feeAmount;
-        }
-        else {
+        } else {
             revert("Token does not match token0 or token1 for the pool");
         }
 
@@ -100,16 +89,13 @@ contract InsurancePoolManager {
         uint256 priceNew // New price ratio (Token0/Token1)
     ) external view returns (uint256) {
         PoolData storage poolData = pools[poolid];
-        uint256 poolTotal = (token == poolData.token0)
-            ? poolData.totalContributionsToken0
-            : poolData.totalContributionsToken1;
+        uint256 poolTotal =
+            (token == poolData.token0) ? poolData.totalContributionsToken0 : poolData.totalContributionsToken1;
 
-        uint256 lpLiquidity = (token == poolData.token0)
-            ? poolData.lpLiquidityToken0[lp]
-            : poolData.lpLiquidityToken1[lp];
-        uint256 totalLiquidity = (token == poolData.token0)
-            ? poolData.totalLiquidityToken0
-            : poolData.totalLiquidityToken1;
+        uint256 lpLiquidity =
+            (token == poolData.token0) ? poolData.lpLiquidityToken0[lp] : poolData.lpLiquidityToken1[lp];
+        uint256 totalLiquidity =
+            (token == poolData.token0) ? poolData.totalLiquidityToken0 : poolData.totalLiquidityToken1;
 
         // Calculate LP's liquidity share
         uint256 liquidityShare = (lpLiquidity * 1e18) / totalLiquidity;
@@ -136,36 +122,32 @@ contract InsurancePoolManager {
         return y;
     }
 
-    // ** Flash Loan Fees Distribution to pools according to their share of liquidity(through swap fees) in insurance pool** after every flash loan repayment 
+    // ** Flash Loan Fees Distribution to pools according to their share of liquidity(through swap fees) in insurance pool** after every flash loan repayment
     //significantly better if done offchain
     function distributeFlashLoanFees(address token, uint256 feeAmount) internal {
-    TokenData storage tokenData = tokens[token];
-    require(tokenData.totalFunds > 0, "No token funds to distribute");
+        TokenData storage tokenData = tokens[token];
+        require(tokenData.totalFunds > 0, "No token funds to distribute");
 
+        // Distribute fees proportionally to each pool
+        for (uint256 i = 0; i < poolList.length; i++) {
+            address pool = poolList[i];
+            uint256 poolShare = tokenData.poolContributions[pool];
+            uint256 distributedFee = (feeAmount * poolShare) / tokenData.totalFunds;
 
-    // Distribute fees proportionally to each pool
-    for (uint256 i = 0; i < poolList.length; i++) {
-        address pool = poolList[i];
-        uint256 poolShare = tokenData.poolContributions[pool];
-        uint256 distributedFee = (feeAmount * poolShare) / tokenData.totalFunds;
-
-        // Check if the token corresponds to token0 or token1 for the pool
-        PoolData storage poolData = pools[pool];
-        if (token == poolData.token0) {
-            poolData.totalContributionsToken0 += distributedFee;
-        } else if (token == poolData.token1) {
-            poolData.totalContributionsToken1 += distributedFee;
-        } else {
-            continue;
+            // Check if the token corresponds to token0 or token1 for the pool
+            PoolData storage poolData = pools[pool];
+            if (token == poolData.token0) {
+                poolData.totalContributionsToken0 += distributedFee;
+            } else if (token == poolData.token1) {
+                poolData.totalContributionsToken1 += distributedFee;
+            } else {
+                continue;
+            }
         }
     }
-}
-//transfering funds to borrower for flash loan
-function transferFunds(
-        address token,
-        address to,
-        uint256 amount
-    ) external onlyFlashLoanContract returns (bool) {
+    //transfering funds to borrower for flash loan
+
+    function transferFunds(address token, address to, uint256 amount) external onlyFlashLoanContract returns (bool) {
         // Check if sufficient funds are available in the insurance pool
         TokenData storage tokenData = tokens[token];
         require(tokenData.totalFunds >= amount, "Insufficient funds in the insurance pool");
@@ -187,20 +169,19 @@ function transferFunds(
         distributeFlashLoanFees(token, loanFee);
     }
 
+    function initializePoolData(address poolid, address token0, address token1) external {
+        poolList.push(poolid);
+        PoolData storage poolData = pools[poolid];
+        poolData.token0 = token0;
+        poolData.token1 = token1;
+    }
 
-    function initializePoolData(
-    address poolid,
-    address token0,
-    address token1
-) external {
-    poolList.push(poolid);
-    PoolData storage poolData = pools[poolid];
-    poolData.token0 = token0;
-    poolData.token1 = token1;
+    // Add these missing functions that FlashLender.sol is trying to call
+    function isTokenSupported(address token) public view returns (bool) {
+        return tokens[token].totalFunds > 0;
+    }
+
+    function getAvailableLiquidity(address token) public view returns (uint256) {
+        return tokens[token].totalFunds;
+    }
 }
-
-}
-
-
-
-
