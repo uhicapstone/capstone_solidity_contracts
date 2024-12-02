@@ -39,6 +39,7 @@ contract FlashBorrower is IERC3156FlashBorrower {
      */
     function onFlashLoan(address initiator, address token, uint256 amount, uint256 fee, bytes calldata data)
         external
+        view
         override
         returns (bytes32)
     {
@@ -55,11 +56,21 @@ contract FlashBorrower is IERC3156FlashBorrower {
         // Decode the action from the data
         (Action action) = abi.decode(data, (Action));
 
-        // Handle the action
+        // Handle the action with the loan parameters
         if (action == Action.NORMAL) {
-            // Perform a normal operation
+            // Verify the loan amount and fee
+            require(amount > 0, "Loan amount must be greater than 0");
+            require(fee >= 0, "Fee must be non-negative");
+
+            // Verify we have enough balance of the token to repay
+            require(IERC20(token).balanceOf(address(this)) >= amount + fee, "Insufficient balance for repayment");
         } else if (action == Action.OTHER) {
-            // Perform another operation
+            // Handle other operations that might need different validations
+            // For example, checking if the fee is within acceptable limits
+            require(
+                fee <= (amount * 10) / 100, // 10% max fee
+                "Fee exceeds maximum allowed"
+            );
         }
 
         // Return the success callback
