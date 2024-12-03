@@ -11,11 +11,44 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
 
+// Add interface for Stylus contract
+interface IInsuranceCalculator {
+    function calculateInsuranceFee(
+        bytes32 poolId,
+        uint256 amount,
+        uint256 totalLiquidity,
+        uint256 totalVolume,
+        uint256 currentPrice,
+        uint256 timestamp
+    ) external returns (uint256);
+
+    function calculateIlCompensation(
+        uint256 lpShare,
+        uint256 insuranceFund,
+        uint256 priceOld,
+        uint256 priceNew,
+        uint256 timeInPool,
+        uint256 totalLiquidity
+    ) external view returns (uint256);
+
+    function calculateFlashLoanFee(
+        uint256 loanAmount,
+        uint256 totalLiquidity,
+        uint256 utilizationRate,
+        uint256 defaultHistory
+    ) external view returns (uint256);
+
+    function calculateVolatility(bytes32 poolId, uint256 currentPrice, uint256 timestamp) external returns (uint256);
+}
+
 contract InsurancePoolHook is BaseHook {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
 
     address public flashLoanContract;
+
+    // Add calculator reference
+    IInsuranceCalculator public immutable insuranceCalculator;
 
     modifier onlyFlashLoanContract() {
         require(msg.sender == flashLoanContract, "Caller is not the flash loan contract");
@@ -47,8 +80,11 @@ contract InsurancePoolHook is BaseHook {
     mapping(address => TokenData) public tokenData;
     address[] public poolList;
 
-    constructor(IPoolManager _poolManager, address _flashLoanContract) BaseHook(_poolManager) {
+    constructor(IPoolManager _poolManager, address _flashLoanContract, address _insuranceCalculator)
+        BaseHook(_poolManager)
+    {
         flashLoanContract = _flashLoanContract;
+        insuranceCalculator = IInsuranceCalculator(_insuranceCalculator);
     }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
@@ -91,17 +127,32 @@ contract InsurancePoolHook is BaseHook {
         PoolId poolId = key.toId();
         PoolData storage poolData = poolDataMap[poolId];
 
-        // Calculate insurance fee (0.1%)
-        int256 insuranceFee = (-params.amountSpecified * 1) / 1000;
+        uint256 amount = params.zeroForOne ? uint256(-params.amountSpecified) : uint256(-params.amountSpecified);
+        uint256 totalVolume = poolData.totalContributionsToken0 + poolData.totalContributionsToken1;
+
+        // Calculate current price
+        uint256 currentPrice = poolData.totalLiquidityToken1 > 0
+            ? (poolData.totalLiquidityToken0 * 1e18) / poolData.totalLiquidityToken1
+            : 0;
+
+        // Get insurance fee from Stylus contract
+        uint256 insuranceFee = insuranceCalculator.calculateInsuranceFee(
+            PoolId.unwrap(poolId),
+            amount,
+            params.zeroForOne ? poolData.totalLiquidityToken0 : poolData.totalLiquidityToken1,
+            totalVolume,
+            currentPrice,
+            block.timestamp
+        );
 
         if (params.zeroForOne) {
-            poolData.insuranceFees0 += uint256(insuranceFee > 0 ? insuranceFee : -insuranceFee);
-            allocateFeesToPool(poolId, poolData.token0, uint256(insuranceFee > 0 ? insuranceFee : -insuranceFee));
-            return (BaseHook.beforeSwap.selector, toBeforeSwapDelta(int128(insuranceFee), 0), 0);
+            poolData.insuranceFees0 += insuranceFee;
+            allocateFeesToPool(poolId, poolData.token0, insuranceFee);
+            return (BaseHook.beforeSwap.selector, toBeforeSwapDelta(int128(int256(insuranceFee)), 0), 0);
         } else {
-            poolData.insuranceFees1 += uint256(insuranceFee > 0 ? insuranceFee : -insuranceFee);
-            allocateFeesToPool(poolId, poolData.token1, uint256(insuranceFee > 0 ? insuranceFee : -insuranceFee));
-            return (BaseHook.beforeSwap.selector, toBeforeSwapDelta(0, int128(insuranceFee)), 0);
+            poolData.insuranceFees1 += insuranceFee;
+            allocateFeesToPool(poolId, poolData.token1, insuranceFee);
+            return (BaseHook.beforeSwap.selector, toBeforeSwapDelta(0, int128(int256(insuranceFee))), 0);
         }
     }
 
@@ -114,8 +165,8 @@ contract InsurancePoolHook is BaseHook {
         bytes calldata
     ) external override returns (bytes4, BalanceDelta) {
         // Convert negative deltas to positive amounts
-        uint256 amount0 = delta.amount0() >= 0 ? uint256(uint128(delta.amount0())) : uint256(uint128(-delta.amount0()));
-        uint256 amount1 = delta.amount1() >= 0 ? uint256(uint128(delta.amount1())) : uint256(uint128(-delta.amount1()));
+        uint256 amount0 = delta.amount0() >= 0 ? uint256(int256(delta.amount0())) : uint256(-int256(delta.amount0()));
+        uint256 amount1 = delta.amount1() >= 0 ? uint256(int256(delta.amount1())) : uint256(-int256(delta.amount1()));
 
         // Use msg.sender as the LP address since it's the PositionManager
         updateLPLiquidity(key.toId(), sender, amount0, amount1, true);
@@ -132,8 +183,8 @@ contract InsurancePoolHook is BaseHook {
         bytes calldata
     ) external override returns (bytes4, BalanceDelta) {
         // Convert negative deltas to positive amounts for removal
-        uint256 amount0 = delta.amount0() >= 0 ? uint256(uint128(delta.amount0())) : uint256(uint128(-delta.amount0()));
-        uint256 amount1 = delta.amount1() >= 0 ? uint256(uint128(delta.amount1())) : uint256(uint128(-delta.amount1()));
+        uint256 amount0 = delta.amount0() >= 0 ? uint256(int256(delta.amount0())) : uint256(-int256(delta.amount0()));
+        uint256 amount1 = delta.amount1() >= 0 ? uint256(int256(delta.amount1())) : uint256(-int256(delta.amount1()));
 
         // Use msg.sender as the LP address since it's the PositionManager
         updateLPLiquidity(key.toId(), sender, amount0, amount1, false);
@@ -213,33 +264,21 @@ contract InsurancePoolHook is BaseHook {
         returns (uint256)
     {
         PoolData storage poolData = poolDataMap[poolId];
-        uint256 poolTotal =
-            (token == poolData.token0) ? poolData.totalContributionsToken0 : poolData.totalContributionsToken1;
-        uint256 lpLiquidity =
-            (token == poolData.token0) ? poolData.lpLiquidityToken0[lp] : poolData.lpLiquidityToken1[lp];
+
+        uint256 lpLiquidity = token == poolData.token0 ? poolData.lpLiquidityToken0[lp] : poolData.lpLiquidityToken1[lp];
         uint256 totalLiquidity =
-            (token == poolData.token0) ? poolData.totalLiquidityToken0 : poolData.totalLiquidityToken1;
+            token == poolData.token0 ? poolData.totalLiquidityToken0 : poolData.totalLiquidityToken1;
 
-        // Calculate LP's share
-        uint256 liquidityShare = (lpLiquidity * 1e18) / totalLiquidity;
+        uint256 lpShare = totalLiquidity > 0 ? (lpLiquidity * 1e18) / totalLiquidity : 0;
 
-        // Calculate IL factor
-        uint256 priceRatioChange = (priceNew * 1e18) / priceOld;
-        uint256 ILF = 1e18 - sqrt(priceRatioChange);
-        if (ILF > 1e18) ILF = 0;
+        uint256 insuranceFund = token == poolData.token0 ? poolData.insuranceFees0 : poolData.insuranceFees1;
 
-        return (liquidityShare * poolTotal * ILF) / 1e36;
-    }
+        // Calculate time in pool (simplified - you might want to track entry time)
+        uint256 timeInPool = 86400; // 1 day for example
 
-    // Helper function for square root calculation
-    function sqrt(uint256 x) internal pure returns (uint256) {
-        uint256 z = (x + 1) / 2;
-        uint256 y = x;
-        while (z < y) {
-            y = z;
-            z = (x / z + z) / 2;
-        }
-        return y;
+        return insuranceCalculator.calculateIlCompensation(
+            lpShare, insuranceFund, priceOld, priceNew, timeInPool, totalLiquidity
+        );
     }
 
     // Flash loan related functions
@@ -254,6 +293,19 @@ contract InsurancePoolHook is BaseHook {
 
     function handleRepayment(address token, uint256 amount, uint256 loanFee) external onlyFlashLoanContract {
         TokenData storage tokenDataRef = tokenData[token];
+
+        // Calculate utilization rate
+        uint256 utilizationRate = tokenDataRef.totalFunds > 0 ? (amount * 1e18) / tokenDataRef.totalFunds : 0;
+
+        // Calculate default history (simplified - you might want to track this)
+        uint256 defaultHistory = 0;
+
+        // Get flash loan fee from Stylus contract
+        uint256 calculatedFee =
+            insuranceCalculator.calculateFlashLoanFee(amount, tokenDataRef.totalFunds, utilizationRate, defaultHistory);
+
+        require(loanFee >= calculatedFee, "Fee too low");
+
         tokenDataRef.totalFunds += amount;
         distributeFlashLoanFees(token, loanFee);
     }
@@ -279,5 +331,15 @@ contract InsurancePoolHook is BaseHook {
 
     function getAvailableLiquidity(address token) external view returns (uint256) {
         return tokenData[token].totalFunds;
+    }
+
+    // Add helper function to get volatility if needed
+    function getVolatility(PoolId poolId) internal returns (uint256) {
+        PoolData storage poolData = poolDataMap[poolId];
+        uint256 currentPrice = poolData.totalLiquidityToken1 > 0
+            ? (poolData.totalLiquidityToken0 * 1e18) / poolData.totalLiquidityToken1
+            : 0;
+
+        return insuranceCalculator.calculateVolatility(PoolId.unwrap(poolId), currentPrice, block.timestamp);
     }
 }
