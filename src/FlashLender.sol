@@ -1,83 +1,89 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts/interfaces/IERC3156FlashBorrower.sol";
-import "@openzeppelin/contracts/interfaces/IERC20.sol";
-import "@openzeppelin/contracts/interfaces/IERC3156FlashLender.sol";
-import "./InsurancePoolHook.sol";
+import {IERC3156FlashBorrower} from "@openzeppelin/contracts/interfaces/IERC3156FlashBorrower.sol";
+import {IERC20} from "@openzeppelin/contracts/interfaces/IERC20.sol";
+import {IERC3156FlashLender} from "@openzeppelin/contracts/interfaces/IERC3156FlashLender.sol";
+import {InsurancePoolHook} from "./InsurancePoolHook.sol";
+import {IInsuranceCalculator} from "./interfaces/IInsuranceCalculator.sol";
 
+/**
+ * @title FlashLender
+ * @notice Professional flash loan provider integrated with InsurancePoolHook
+ * @dev Implements ERC-3156 Flash Loan standard
+ */
 contract FlashLender is IERC3156FlashLender {
     bytes32 public constant CALLBACK_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
-    InsurancePoolHook public insurancePoolHook;
+    InsurancePoolHook public immutable insurancePool;
+    IInsuranceCalculator public immutable calculator;
 
-    uint256 public fee; // Fee percentage in basis points (bps)
+    error InvalidToken(address token);
+    error InvalidCallback(address borrower);
+    error RepaymentFailed(address token, uint256 amount);
+    error InsufficientLiquidity(address token, uint256 requested, uint256 available);
 
-    error TransferFailed(address token, address to, uint256 amount);
-    error CallbackFailed(address receiver);
-    error RepaymentFailed(address token, address from, uint256 amount);
-    error UnsupportedToken(address token);
+    event FlashLoan(
+        address indexed borrower, address indexed token, uint256 amount, uint256 fee, address indexed operator
+    );
 
-    /**
-     * @param insurancePoolHook_ The address of the InsurancePoolHook contract.
-     * @param fee_ The percentage of the loan `amount` that needs to be repaid, in addition to `amount`.
-     */
-    constructor(address insurancePoolHook_, uint256 fee_) {
-        insurancePoolHook = InsurancePoolHook(insurancePoolHook_);
-        fee = fee_;
+    constructor(address _insurancePool, address _calculator) {
+        insurancePool = InsurancePoolHook(_insurancePool);
+        calculator = IInsuranceCalculator(_calculator);
     }
 
     /**
-     * @dev Loan `amount` tokens to `receiver`, and takes it back plus a `flashFee` after the callback.
+     * @notice Execute a flash loan
+     * @param receiver The contract receiving the tokens
+     * @param token The loan currency
+     * @param amount The amount of tokens lent
+     * @param data Arbitrary data structure, intended to contain user-defined parameters
      */
     function flashLoan(IERC3156FlashBorrower receiver, address token, uint256 amount, bytes calldata data)
         external
         override
         returns (bool)
     {
-        uint256 loanFee = _flashFee(token, amount);
-
-        // Transfer tokens from the InsurancePool
-        if (!insurancePoolHook.transferFunds(token, address(receiver), amount)) {
-            revert TransferFailed(token, address(receiver), amount);
+        uint256 fee = flashFee(token, amount);
+        uint256 availableLiquidity = maxFlashLoan(token);
+        if (availableLiquidity < amount) {
+            revert InsufficientLiquidity(token, amount, availableLiquidity);
         }
 
-        // Callback to the receiver
-        if (receiver.onFlashLoan(msg.sender, token, amount, loanFee, data) != CALLBACK_SUCCESS) {
-            revert CallbackFailed(address(receiver));
+        // Transfer loan to receiver
+        if (!IERC20(token).transfer(address(receiver), amount)) {
+            revert InvalidToken(token);
         }
 
-        // Pull repayment from the receiver
-        uint256 totalRepayment = amount + loanFee;
-        if (!IERC20(token).transferFrom(address(receiver), address(insurancePoolHook), totalRepayment)) {
-            revert RepaymentFailed(token, address(receiver), totalRepayment);
+        // Get callback confirmation
+        if (receiver.onFlashLoan(msg.sender, token, amount, fee, data) != CALLBACK_SUCCESS) {
+            revert InvalidCallback(address(receiver));
         }
 
-        insurancePoolHook.handleRepayment(token, amount, loanFee);
+        // Transfer repayment
+        if (!IERC20(token).transferFrom(address(receiver), address(insurancePool), amount + fee)) {
+            revert RepaymentFailed(token, amount + fee);
+        }
 
+        emit FlashLoan(address(receiver), token, amount, fee, msg.sender);
         return true;
     }
 
     /**
-     * @dev The fee to be charged for a given loan.
+     * @notice Calculate the fee for a flash loan
+     * @param token The loan currency
+     * @param amount The amount of tokens lent
+     * @return The amount of `token` to be charged for the flash loan, on top of the returned principal
      */
-    function flashFee(address token, uint256 amount) external view override returns (uint256) {
-        return _flashFee(token, amount);
+    function flashFee(address token, uint256 amount) public view override returns (uint256) {
+        return insurancePool.flashFee(token, amount);
     }
 
     /**
-     * @dev Internal function to calculate the fee for a given loan.
+     * @notice Get the maximum flash loan amount for a token
+     * @param token The loan currency
+     * @return The maximum amount of `token` that can be flash-borrowed
      */
-    function _flashFee(address token, uint256 amount) internal view returns (uint256) {
-        if (!insurancePoolHook.isTokenSupported(token)) {
-            revert UnsupportedToken(token);
-        }
-        return (amount * fee) / 10000;
-    }
-
-    /**
-     * @dev The amount of currency available to be lent.
-     */
-    function maxFlashLoan(address token) external view override returns (uint256) {
-        return insurancePoolHook.getAvailableLiquidity(token);
+    function maxFlashLoan(address token) public view override returns (uint256) {
+        return insurancePool.maxFlashLoan(token);
     }
 }
