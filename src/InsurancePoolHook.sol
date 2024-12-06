@@ -6,7 +6,7 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
-import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {BalanceDelta, BalanceDeltaLibrary} from "v4-core/src/types/BalanceDelta.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
@@ -126,6 +126,7 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolId);
         uint256 currentPrice = uint256(sqrtPriceX96) * uint256(sqrtPriceX96) * 1e18 >> (96 * 2);
 
+        // Calculate insurance fee
         uint256 insuranceFee = insuranceCalculator.calculateInsuranceFee(
             PoolId.unwrap(poolId),
             amount,
@@ -135,16 +136,28 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
             block.timestamp
         );
 
+        // Get input currency
         Currency inputCurrency = params.zeroForOne ? key.currency0 : key.currency1;
-        poolManager.mint(address(this), inputCurrency.toId(), insuranceFee);
 
+        // Take tokens from user and mint claim tokens for the hook
+        // The hook will receive claim tokens representing the insurance fee
+        _mintClaimTokens(inputCurrency, insuranceFee);
+
+        // Update insurance fee tracking
         _updateInsuranceFees(poolData, params.zeroForOne, amount, insuranceFee);
 
         emit InsuranceFeesCollected(
             params.zeroForOne ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1), amount, insuranceFee
         );
 
-        return (BaseHook.beforeSwap.selector, toBeforeSwapDelta(int128(int256(insuranceFee)), 0), 0);
+        // Return BeforeSwapDelta to charge the insurance fee
+        // The first parameter is the specified token delta (the insurance fee)
+        // The second parameter is 0 since we're not modifying the unspecified token amount
+        return (
+            BaseHook.beforeSwap.selector,
+            toBeforeSwapDelta(int128(int256(insuranceFee)), 0),
+            0 // No LP fee override
+        );
     }
 
     function _updateInsuranceFees(PoolData storage poolData, bool zeroForOne, uint256 amount, uint256 fee) internal {
@@ -194,6 +207,14 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         }
     }
 
+    function _mintClaimTokens(Currency currency, uint256 amount) internal {
+        poolManager.mint(address(this), currency.toId(), amount);
+    }
+
+    function _burnClaimTokens(Currency currency, uint256 amount) internal {
+        poolManager.burn(address(this), currency.toId(), amount);
+    }
+
     function afterAddLiquidity(
         address sender,
         PoolKey calldata key,
@@ -202,7 +223,30 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         BalanceDelta,
         bytes calldata
     ) external override returns (bytes4, BalanceDelta) {
-        _updateLiquidity(sender, key, delta, true);
+        // Get positive deltas only
+        uint256 amount0 = delta.amount0() > 0 ? uint256(uint128(delta.amount0())) : 0;
+        uint256 amount1 = delta.amount1() > 0 ? uint256(uint128(delta.amount1())) : 0;
+
+        PoolId poolId = key.toId();
+        PoolData storage poolData = poolDataMap[poolId];
+
+        // Update pool data
+        if (amount0 > 0) {
+            poolData.lpLiquidityToken0[sender] += amount0;
+            poolData.totalLiquidityToken0 += amount0;
+            // Mint claim tokens for the hook
+            _mintClaimTokens(key.currency0, amount0);
+        }
+        if (amount1 > 0) {
+            poolData.lpLiquidityToken1[sender] += amount1;
+            poolData.totalLiquidityToken1 += amount1;
+            // Mint claim tokens for the hook
+            _mintClaimTokens(key.currency1, amount1);
+        }
+
+        emit LiquidityUpdated(sender, Currency.unwrap(key.currency0), amount0, true);
+        emit LiquidityUpdated(sender, Currency.unwrap(key.currency1), amount1, true);
+
         return (BaseHook.afterAddLiquidity.selector, BalanceDelta.wrap(0));
     }
 
@@ -214,36 +258,31 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         BalanceDelta,
         bytes calldata
     ) external override returns (bytes4, BalanceDelta) {
-        _updateLiquidity(sender, key, delta, false);
-        return (BaseHook.afterRemoveLiquidity.selector, BalanceDelta.wrap(0));
-    }
+        // Get negative deltas only (convert to positive amounts)
+        uint256 amount0 = delta.amount0() < 0 ? uint256(uint128(-delta.amount0())) : 0;
+        uint256 amount1 = delta.amount1() < 0 ? uint256(uint128(-delta.amount1())) : 0;
 
-    function _updateLiquidity(address sender, PoolKey calldata key, BalanceDelta delta, bool isAdd) internal {
-        PoolData storage poolData = poolDataMap[key.toId()];
+        PoolId poolId = key.toId();
+        PoolData storage poolData = poolDataMap[poolId];
 
-        if (isAdd) {
-            if (delta.amount0() > 0) {
-                uint256 amount0 = uint128(delta.amount0());
-                poolData.lpLiquidityToken0[sender] += amount0;
-                poolData.totalLiquidityToken0 += amount0;
-            }
-            if (delta.amount1() > 0) {
-                uint256 amount1 = uint128(delta.amount1());
-                poolData.lpLiquidityToken1[sender] += amount1;
-                poolData.totalLiquidityToken1 += amount1;
-            }
-        } else {
-            if (delta.amount0() < 0) {
-                uint256 amount0 = uint128(-delta.amount0());
-                poolData.lpLiquidityToken0[sender] -= amount0;
-                poolData.totalLiquidityToken0 -= amount0;
-            }
-            if (delta.amount1() < 0) {
-                uint256 amount1 = uint128(-delta.amount1());
-                poolData.lpLiquidityToken1[sender] -= amount1;
-                poolData.totalLiquidityToken1 -= amount1;
-            }
+        // Update pool data
+        if (amount0 > 0) {
+            poolData.lpLiquidityToken0[sender] -= amount0;
+            poolData.totalLiquidityToken0 -= amount0;
+            // Burn claim tokens from the hook
+            _burnClaimTokens(key.currency0, amount0);
         }
+        if (amount1 > 0) {
+            poolData.lpLiquidityToken1[sender] -= amount1;
+            poolData.totalLiquidityToken1 -= amount1;
+            // Burn claim tokens from the hook
+            _burnClaimTokens(key.currency1, amount1);
+        }
+
+        emit LiquidityUpdated(sender, Currency.unwrap(key.currency0), amount0, false);
+        emit LiquidityUpdated(sender, Currency.unwrap(key.currency1), amount1, false);
+
+        return (BaseHook.afterRemoveLiquidity.selector, BalanceDelta.wrap(0));
     }
 
     function getVolatility(PoolId poolId) internal returns (uint256) {
@@ -277,17 +316,21 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         nonReentrant
         returns (bool)
     {
-        TokenData storage tokenDataRef = tokenData[token];
-        if (tokenDataRef.totalFunds < amount) {
-            revert InsufficientLiquidity(amount, tokenDataRef.totalFunds);
+        Currency currency = Currency.wrap(token);
+        uint256 claimBalance = poolManager.balanceOf(address(this), currency.toId());
+
+        if (claimBalance < amount) {
+            revert InsufficientLiquidity(amount, claimBalance);
         }
 
         uint256 fee = this.flashFee(token, amount);
         uint256 repayment = amount + fee;
 
-        // Transfer tokens to receiver
-        tokenDataRef.totalFunds -= amount;
-        if (!IERC20(token).transfer(address(receiver), amount)) revert TransferFailed();
+        // Burn claim tokens to allow withdrawal
+        _burnClaimTokens(currency, amount);
+
+        // Transfer tokens to receiver through PoolManager
+        poolManager.take(currency, address(receiver), amount);
 
         // Callback to receiver
         if (receiver.onFlashLoan(msg.sender, token, amount, fee, data) != CALLBACK_SUCCESS) {
@@ -299,8 +342,9 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
             revert RepaymentFailed(token, address(receiver), repayment);
         }
 
-        // Update token data
-        tokenDataRef.totalFunds += repayment;
+        // Send repayment to PoolManager and mint new claim tokens
+        IERC20(token).approve(address(poolManager), repayment);
+        poolManager.mint(address(this), currency.toId(), repayment);
 
         emit FlashLoanExecuted(address(receiver), token, amount, fee);
         return true;
@@ -316,6 +360,7 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
     }
 
     function maxFlashLoan(address token) external view override returns (uint256) {
-        return tokenData[token].totalFunds;
+        Currency currency = Currency.wrap(token);
+        return poolManager.balanceOf(address(this), currency.toId());
     }
 }
