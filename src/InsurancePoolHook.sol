@@ -31,7 +31,7 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
     using StateLibrary for IPoolManager;
 
     // Immutable state variables
-    IInsuranceCalculator public immutable insuranceCalculator;
+    IInsuranceCalculator public insuranceCalculator;
     bytes32 public constant CALLBACK_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
 
     // Custom errors
@@ -73,8 +73,11 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
     mapping(address => TokenData) public tokenData;
     address[] public poolList;
 
-    constructor(IPoolManager _poolManager, address _calculator) BaseHook(_poolManager) {
+    constructor(IPoolManager _poolManager) BaseHook(_poolManager) {}
+
+    function setCalculator(address _calculator) external {
         if (_calculator == address(0)) revert Unauthorized();
+        if (address(insuranceCalculator) != address(0)) revert Unauthorized();
         insuranceCalculator = IInsuranceCalculator(_calculator);
     }
 
@@ -99,10 +102,8 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
 
     function afterInitialize(address, PoolKey calldata key, uint160, int24) external override returns (bytes4) {
         PoolId poolId = key.toId();
-        // Convert PoolId to bytes32 then address for poolList tracking
         poolList.push(address(uint160(bytes20(abi.encodePacked(poolId)))));
 
-        // Initialize pool data
         PoolData storage poolData = poolDataMap[poolId];
         poolData.token0 = Currency.unwrap(key.currency0);
         poolData.token1 = Currency.unwrap(key.currency1);
@@ -151,8 +152,6 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         );
 
         // Return BeforeSwapDelta to charge the insurance fee
-        // The first parameter is the specified token delta (the insurance fee)
-        // The second parameter is 0 since we're not modifying the unspecified token amount
         return (
             BaseHook.beforeSwap.selector,
             toBeforeSwapDelta(int128(int256(insuranceFee)), 0),
@@ -208,10 +207,12 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
     }
 
     function _mintClaimTokens(Currency currency, uint256 amount) internal {
+        // Mint claim tokens to the hook contract
         poolManager.mint(address(this), currency.toId(), amount);
     }
 
     function _burnClaimTokens(Currency currency, uint256 amount) internal {
+        // Burn claim tokens from the hook contract
         poolManager.burn(address(this), currency.toId(), amount);
     }
 
@@ -230,18 +231,14 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         PoolId poolId = key.toId();
         PoolData storage poolData = poolDataMap[poolId];
 
-        // Update pool data
+        // Update pool data - just track liquidity positions
         if (amount0 > 0) {
             poolData.lpLiquidityToken0[sender] += amount0;
             poolData.totalLiquidityToken0 += amount0;
-            // Mint claim tokens for the hook
-            _mintClaimTokens(key.currency0, amount0);
         }
         if (amount1 > 0) {
             poolData.lpLiquidityToken1[sender] += amount1;
             poolData.totalLiquidityToken1 += amount1;
-            // Mint claim tokens for the hook
-            _mintClaimTokens(key.currency1, amount1);
         }
 
         emit LiquidityUpdated(sender, Currency.unwrap(key.currency0), amount0, true);
@@ -265,18 +262,14 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         PoolId poolId = key.toId();
         PoolData storage poolData = poolDataMap[poolId];
 
-        // Update pool data
+        // Update pool data - just track liquidity positions
         if (amount0 > 0) {
             poolData.lpLiquidityToken0[sender] -= amount0;
             poolData.totalLiquidityToken0 -= amount0;
-            // Burn claim tokens from the hook
-            _burnClaimTokens(key.currency0, amount0);
         }
         if (amount1 > 0) {
             poolData.lpLiquidityToken1[sender] -= amount1;
             poolData.totalLiquidityToken1 -= amount1;
-            // Burn claim tokens from the hook
-            _burnClaimTokens(key.currency1, amount1);
         }
 
         emit LiquidityUpdated(sender, Currency.unwrap(key.currency0), amount0, false);
