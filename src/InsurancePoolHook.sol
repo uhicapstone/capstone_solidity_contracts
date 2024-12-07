@@ -173,25 +173,25 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         IPoolManager.ModifyLiquidityParams calldata params,
         bytes calldata hookData
     ) external virtual override returns (bytes4) {
-        // Get the liquidity provider address from hookData
+        // Decode the liquidity provider's address from hookData
         address liquidityProvider = abi.decode(hookData, (address));
 
-        // Get the pool ID and data
+        // Get the PoolId from PoolKey
         PoolId poolId = key.toId();
         PoolData storage poolData = poolDataMap[poolId];
 
-        // Calculate claimable fees
+        // Calculate claimable fees based on user's liquidity
         (uint256 fees0, uint256 fees1) = _calculateClaimableFees(poolData, poolId, params, liquidityProvider);
         if (fees0 == 0 && fees1 == 0) revert NoFeesToClaim();
 
-        // Update accounting before transfers
+        // Update accounting before transferring fees
         if (fees0 > 0) {
             poolData.totalContributionsToken0 -= fees0;
             tokenDataMap[poolData.token0].totalFunds -= fees0;
             tokenDataMap[poolData.token0].poolContributions[poolId] -= fees0;
 
-            // Take tokens from hook and give to user
-            key.currency0.settle(poolManager, liquidityProvider, fees0, true);
+            // Transfer fees to the liquidity provider
+            key.currency0.settle(poolManager, liquidityProvider, fees0, false);
             emit InsuranceFeeClaimed(liquidityProvider, poolData.token0, fees0);
         }
 
@@ -200,7 +200,8 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
             tokenDataMap[poolData.token1].totalFunds -= fees1;
             tokenDataMap[poolData.token1].poolContributions[poolId] -= fees1;
 
-            key.currency1.settle(poolManager, liquidityProvider, fees1, true);
+            // Transfer fees to the liquidity provider
+            key.currency1.settle(poolManager, liquidityProvider, fees1, false);
             emit InsuranceFeeClaimed(liquidityProvider, poolData.token1, fees1);
         }
 
@@ -211,11 +212,11 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         PoolData storage poolData,
         PoolId poolId,
         IPoolManager.ModifyLiquidityParams calldata params,
-        address liquiditiyProvider
+        address liquidityProvider
     ) internal view returns (uint256 fees0, uint256 fees1) {
         // Fetch position info for the user
         (uint128 userLiquidity,,) =
-            poolManager.getPositionInfo(poolId, liquiditiyProvider, params.tickLower, params.tickUpper, params.salt);
+            poolManager.getPositionInfo(poolId, liquidityProvider, params.tickLower, params.tickUpper, params.salt);
 
         // Fetch total liquidity from PoolManager
         uint128 totalLiquidity = poolManager.getLiquidity(poolId);

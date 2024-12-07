@@ -20,18 +20,23 @@ contract InsurancePoolHookTest is Test, Deployers {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
 
+    // Contracts
     InsurancePoolHook hook;
     MockInsuranceCalculator calculator;
     MockFlashBorrower borrower;
 
+    // Events (mirroring those from InsurancePoolHook for expectEmit)
     event FlashLoanExecuted(address indexed borrower, address indexed token, uint256 amount, uint256 fee);
     event InsuranceFeesCollected(address indexed token, uint256 amount, uint256 fee);
     event InsuranceFeeClaimed(address indexed user, address indexed token, uint256 amount);
 
+    // PoolKey and identifiers
+    PoolId poolId;
+
     function setUp() public {
         // Deploy fresh manager and tokens
         deployFreshManagerAndRouters();
-        (currency0, currency1) = deployMintAndApprove2Currencies();
+        (Currency currency0, Currency currency1) = deployMintAndApprove2Currencies();
 
         // Calculate hook address with correct flags
         address hookAddress = address(
@@ -47,7 +52,7 @@ contract InsurancePoolHookTest is Test, Deployers {
         hook = InsurancePoolHook(hookAddress);
 
         // Initialize pool
-        (key,) = initPool(currency0, currency1, hook, 3000, SQRT_PRICE_1_1);
+        (key, poolId) = initPool(currency0, currency1, hook, 3000, SQRT_PRICE_1_1);
 
         // Approve tokens for the hook
         IERC20(Currency.unwrap(currency0)).approve(address(hook), type(uint256).max);
@@ -61,131 +66,189 @@ contract InsurancePoolHookTest is Test, Deployers {
         );
     }
 
+    /**
+     * @notice Test that insurance fees are correctly collected during a swap.
+     */
     function test_InsuranceFeeCollection() public {
         // Setup swap test settings
         PoolSwapTest.TestSettings memory settings =
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
-        // Get initial balance - using maxFlashLoan instead of direct mapping access
-        uint256 balanceBefore = hook.maxFlashLoan(Currency.unwrap(currency0));
+        // Define swap parameters
+        int256 amountSpecified = -100e18; // Exact input of 100e18
+        bool zeroForOne = true;
 
-        // Expect event emission
+        // Calculate expected fee using the mock calculator
+        uint256 swapAmount = 100e18;
+        uint256 expectedFee = calculator.calculateInsuranceFee(
+            PoolId.unwrap(poolId),
+            swapAmount,
+            0, // totalContributionsToken0
+            0, // totalContributionsToken1
+            0, // currentPrice
+            block.timestamp
+        ); // Expected to be 1% of 100e18 = 1e18
+
+        // Get initial max flash loan amount for currency0
+        address token0 = Currency.unwrap(key.currency0);
+        uint256 balanceBefore = hook.maxFlashLoan(token0);
+
+        // Expect the InsuranceFeesCollected event to be emitted
         vm.expectEmit(true, true, false, true);
-        emit InsuranceFeesCollected(Currency.unwrap(currency0), 100e18, 1e18); // 1% fee on 100e18
+        emit InsuranceFeesCollected(token0, swapAmount, expectedFee);
 
-        // Perform swap
+        // Perform the swap
         swapRouter.swap(
             key,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -100e18,
+                zeroForOne: zeroForOne,
+                amountSpecified: amountSpecified,
                 sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
             settings,
             ZERO_BYTES
         );
 
-        uint256 balanceAfter = hook.maxFlashLoan(Currency.unwrap(currency0));
-        assertGt(balanceAfter, balanceBefore, "Insurance fees not collected");
-        assertEq(balanceAfter - balanceBefore, 1e18, "Incorrect fee amount"); // 1% of 100e18
+        // Get max flash loan amount after swap
+        uint256 balanceAfter = hook.maxFlashLoan(token0);
+
+        // Verify that insurance fees were collected correctly
+        assertEq(balanceAfter - balanceBefore, expectedFee, "Incorrect fee amount collected");
     }
 
+    /**
+     * @notice Test that flash loans execute correctly and fees are charged.
+     */
     function test_FlashLoan() public {
+        // Deploy a mock flash borrower
         borrower = new MockFlashBorrower();
-        uint256 loanAmount = 1e18;
 
-        // First we need to generate some fees to initialize the token data
+        uint256 loanAmount = 1e18;
+        uint256 expectedFee = calculator.calculateFlashLoanFee(loanAmount, 0, 0, 0); // 0.1% of 1e18 = 1e15
+
+        // Generate fees through a swap to ensure liquidity is available for flash loans
         PoolSwapTest.TestSettings memory settings =
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
-        // Do a swap to generate fees and initialize token data
+        // Perform a swap to generate fees
         swapRouter.swap(
             key,
             IPoolManager.SwapParams({
                 zeroForOne: true,
-                amountSpecified: -100e18,
+                amountSpecified: -100e18, // Exact input of 100e18
                 sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
             settings,
             ZERO_BYTES
         );
 
-        // Add additional funds to the insurance pool
-        deal(Currency.unwrap(currency0), address(hook), 10e18);
+        // Add additional funds to the insurance pool to ensure sufficient liquidity
+        address token0 = Currency.unwrap(key.currency0);
+        deal(token0, address(hook), 10e18);
 
-        // Calculate expected fee
-        uint256 expectedFee = hook.flashFee(Currency.unwrap(currency0), loanAmount);
+        // Calculate expected fee based on the mock calculator
+        uint256 actualFee = hook.flashFee(token0, loanAmount);
+        assertEq(actualFee, expectedFee, "Flash loan fee mismatch");
 
         // Prepare borrower with enough tokens for repayment
-        deal(Currency.unwrap(currency0), address(borrower), loanAmount + expectedFee);
+        deal(token0, address(borrower), loanAmount + actualFee);
         vm.startPrank(address(borrower));
-        IERC20(Currency.unwrap(currency0)).approve(address(hook), loanAmount + expectedFee);
+        IERC20(token0).approve(address(hook), loanAmount + actualFee);
         vm.stopPrank();
 
         // Record initial balances
-        uint256 hookBalanceBefore = hook.maxFlashLoan(Currency.unwrap(currency0));
-        uint256 borrowerBalanceBefore = IERC20(Currency.unwrap(currency0)).balanceOf(address(borrower));
+        uint256 hookBalanceBefore = hook.maxFlashLoan(token0);
+        uint256 borrowerBalanceBefore = IERC20(token0).balanceOf(address(borrower));
 
+        // Expect the FlashLoanExecuted event to be emitted
         vm.expectEmit(true, true, false, true);
-        emit FlashLoanExecuted(address(borrower), Currency.unwrap(currency0), loanAmount, expectedFee);
+        emit FlashLoanExecuted(address(borrower), token0, loanAmount, actualFee);
 
-        bool success = hook.flashLoan(borrower, Currency.unwrap(currency0), loanAmount, "");
-        assertTrue(success, "Flash loan failed");
+        // Execute flash loan
+        bool success = hook.flashLoan(borrower, token0, loanAmount, "");
+        assertTrue(success, "Flash loan execution failed");
 
         // Verify final balances
-        uint256 hookBalanceAfter = hook.maxFlashLoan(Currency.unwrap(currency0));
-        uint256 borrowerBalanceAfter = IERC20(Currency.unwrap(currency0)).balanceOf(address(borrower));
+        uint256 hookBalanceAfter = hook.maxFlashLoan(token0);
+        uint256 borrowerBalanceAfter = IERC20(token0).balanceOf(address(borrower));
 
-        // The hook's balance should increase by approximately the fee amount
-        assertGt(hookBalanceAfter, hookBalanceBefore, "Hook balance should increase");
+        // The hook's balance should increase by the fee amount
+        assertEq(hookBalanceAfter - hookBalanceBefore, actualFee, "Hook balance did not increase by fee");
 
         // The borrower should have less balance after paying the fee
-        assertLt(borrowerBalanceAfter, borrowerBalanceBefore, "Borrower balance should decrease");
+        assertEq(borrowerBalanceBefore - borrowerBalanceAfter, actualFee, "Borrower did not pay the correct fee");
     }
 
+    /**
+     * @notice Test claiming insurance fees by removing liquidity.
+     */
     function test_ClaimInsuranceFees() public {
-        // First add liquidity to create the position
+        // Add additional liquidity to create a position with higher liquidity
         modifyLiquidityRouter.modifyLiquidity(
             key,
             IPoolManager.ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 10e18, salt: bytes32(0)}),
             abi.encode(address(this))
         );
 
-        // Generate fees through swap
+        // Generate fees through a swap
         PoolSwapTest.TestSettings memory settings =
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
+        // Perform a swap to generate insurance fees
         swapRouter.swap(
             key,
             IPoolManager.SwapParams({
                 zeroForOne: true,
-                amountSpecified: -100e18,
+                amountSpecified: -100e18, // Exact input of 100e18
                 sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
             settings,
             ZERO_BYTES
         );
 
-        // Get initial balances
-        uint256 initialToken0Balance = IERC20(Currency.unwrap(currency0)).balanceOf(address(this));
-        uint256 initialHookBalance = hook.maxFlashLoan(Currency.unwrap(currency0));
+        // Record initial token0 balance and hook's maxFlashLoan
+        address token0 = Currency.unwrap(key.currency0);
+        uint256 initialToken0Balance = IERC20(token0).balanceOf(address(this));
+        uint256 initialHookBalance = hook.maxFlashLoan(token0);
 
-        // Remove only part of the liquidity to claim fees
+        // Remove a portion of the liquidity to trigger fee claiming
         modifyLiquidityRouter.modifyLiquidity(
             key,
-            IPoolManager.ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: -1e18, salt: bytes32(0)}),
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: -1e18, // Remove 1e18 liquidity
+                salt: bytes32(0)
+            }),
             abi.encode(address(this))
         );
 
-        uint256 finalToken0Balance = IERC20(Currency.unwrap(currency0)).balanceOf(address(this));
-        uint256 finalHookBalance = hook.maxFlashLoan(Currency.unwrap(currency0));
+        // Record final token0 balance and hook's maxFlashLoan
+        uint256 finalToken0Balance = IERC20(token0).balanceOf(address(this));
+        uint256 finalHookBalance = hook.maxFlashLoan(token0);
 
-        // Check that balances changed in the expected direction
-        assertGt(finalToken0Balance, initialToken0Balance, "Token balance should increase");
-        assertLt(finalHookBalance, initialHookBalance, "Hook balance should decrease");
+        // Calculate expected fee based on the mock calculator
+        uint256 expectedFee = calculator.calculateInsuranceFee(
+            PoolId.unwrap(poolId),
+            100e18,
+            0, // totalContributionsToken0 (mocked as 0)
+            0, // totalContributionsToken1 (mocked as 0)
+            0, // currentPrice (mocked as 0)
+            block.timestamp
+        ); // Expected to be 1% of 100e18 = 1e18
+
+        // Verify that the user's token0 balance has increased by the expected fee
+        assertEq(finalToken0Balance - initialToken0Balance, expectedFee, "Incorrect fee claimed");
+
+        // Verify that the hook's maxFlashLoan has decreased by the expected fee
+        assertEq(initialHookBalance - finalHookBalance, expectedFee, "Hook balance did not decrease by fee");
     }
 }
 
+/**
+ * @title MockInsuranceCalculator
+ * @notice A mock calculator for testing purposes, implementing the IInsuranceCalculator interface.
+ */
 contract MockInsuranceCalculator {
     function calculateInsuranceFee(bytes32, uint256 amount, uint256, uint256, uint256, uint256)
         external
@@ -204,12 +267,21 @@ contract MockInsuranceCalculator {
     }
 }
 
+/**
+ * @title MockFlashBorrower
+ * @notice A mock borrower for flash loan testing, implementing the IERC3156FlashBorrower interface.
+ */
 contract MockFlashBorrower is IERC3156FlashBorrower {
+    /**
+     * @notice Callback function called by the flash lender after loan issuance.
+     * @return bytes32 The keccak256 hash of the callback signature.
+     */
     function onFlashLoan(address, address token, uint256 amount, uint256 fee, bytes calldata)
         external
+        override
         returns (bytes32)
     {
-        // Transfer the repayment amount to the lender
+        // Approve the repayment of the loan plus fee
         IERC20(token).approve(msg.sender, amount + fee);
         return keccak256("ERC3156FlashBorrower.onFlashLoan");
     }
