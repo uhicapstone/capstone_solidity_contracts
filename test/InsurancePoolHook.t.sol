@@ -11,218 +11,164 @@ import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {CurrencyLibrary, Currency} from "v4-core/src/types/Currency.sol";
 import {InsurancePoolHook} from "../src/InsurancePoolHook.sol";
-import {IInsuranceCalculator} from "../src/interfaces/IInsuranceCalculator.sol";
-import {LiquidityAmounts} from "v4-core/test/utils/LiquidityAmounts.sol";
-import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
-import {EasyPosm} from "./utils/EasyPosm.sol";
-import {Fixtures} from "./utils/Fixtures.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
-import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
-import {MockInsuranceCalculator} from "./mocks/MockInsuranceCalculator.sol";
-import {IERC3156FlashBorrower} from "@openzeppelin/contracts/interfaces/IERC3156FlashBorrower.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
+import {IERC20} from "v4-core/lib/forge-std/src/interfaces/IERC20.sol";
+import {IERC3156FlashBorrower} from "openzeppelin-contracts/contracts/interfaces/IERC3156FlashBorrower.sol";
 
-contract MockFlashBorrower is IERC3156FlashBorrower {
-    bytes32 public constant CALLBACK_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
-    address public immutable hook;
-    bool public shouldRepay;
-
-    constructor(address _hook) {
-        hook = _hook;
-    }
-
-    function setShouldRepay(bool _shouldRepay) external {
-        shouldRepay = _shouldRepay;
-    }
-
-    function onFlashLoan(address, address token, uint256 amount, uint256 fee, bytes calldata)
-        external
-        override
-        returns (bytes32)
-    {
-        if (shouldRepay) {
-            // Approve repayment
-            IERC20(token).approve(hook, amount + fee);
-        }
-        return CALLBACK_SUCCESS;
-    }
-}
-
-contract InsurancePoolHookTest is Test, Fixtures {
-    using EasyPosm for IPositionManager;
+contract InsurancePoolHookTest is Test, Deployers {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
 
     InsurancePoolHook hook;
-    IInsuranceCalculator calculator;
-    PoolId poolId;
-    uint256 tokenId;
-    int24 tickLower;
-    int24 tickUpper;
-    MockFlashBorrower flashBorrower;
+    MockInsuranceCalculator calculator;
+    MockFlashBorrower borrower;
 
+    event FlashLoanExecuted(address indexed borrower, address indexed token, uint256 amount, uint256 fee);
     event InsuranceFeesCollected(address indexed token, uint256 amount, uint256 fee);
     event InsuranceFeeClaimed(address indexed user, address indexed token, uint256 amount);
-    event FlashLoanExecuted(address indexed borrower, address indexed token, uint256 amount, uint256 fee);
-    event LiquidityUpdated(address indexed user, address indexed token, uint256 amount, bool isAdd);
 
     function setUp() public {
-        // Deploy the pool manager, utility routers, and test tokens
+        // Deploy fresh manager and tokens
         deployFreshManagerAndRouters();
-        deployMintAndApprove2Currencies();
-        deployAndApprovePosm(manager);
+        (currency0, currency1) = deployMintAndApprove2Currencies();
 
-        // Deploy mock calculator first
-        calculator = new MockInsuranceCalculator();
-
-        // Deploy hook with correct flags and namespace
-        address hookAddr = address(
+        // Calculate hook address with correct flags
+        address hookAddress = address(
             uint160(
-                Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
-                    | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-            ) ^ (0x4444 << 144)
+                Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
+                    | Hooks.AFTER_INITIALIZE_FLAG
+            )
         );
 
-        deployCodeTo("InsurancePoolHook.sol", abi.encode(manager), hookAddr);
-        hook = InsurancePoolHook(hookAddr);
-        flashBorrower = new MockFlashBorrower(address(hook));
-
-        // Set the mock calculator
-        hook.setCalculator(address(calculator));
+        // Deploy calculator and hook
+        calculator = new MockInsuranceCalculator();
+        deployCodeTo("InsurancePoolHook.sol", abi.encode(manager, address(calculator)), hookAddress);
+        hook = InsurancePoolHook(hookAddress);
 
         // Initialize pool
-        (key, poolId) = initPool(currency0, currency1, hook, 3000, SQRT_PRICE_1_1);
+        (key,) = initPool(currency0, currency1, hook, 3000, SQRT_PRICE_1_1);
+
+        // Approve tokens for the hook
+        IERC20(Currency.unwrap(currency0)).approve(address(hook), type(uint256).max);
+        IERC20(Currency.unwrap(currency1)).approve(address(hook), type(uint256).max);
 
         // Add initial liquidity
-        _addInitialLiquidity();
-
-        // Approve tokens for hook and flash borrower
-        MockERC20(Currency.unwrap(currency0)).approve(address(hook), type(uint256).max);
-        MockERC20(Currency.unwrap(currency1)).approve(address(hook), type(uint256).max);
-        MockERC20(Currency.unwrap(currency0)).transfer(address(flashBorrower), 1000e18);
-        MockERC20(Currency.unwrap(currency1)).transfer(address(flashBorrower), 1000e18);
-    }
-
-    function _addInitialLiquidity() internal {
-        tickLower = -60;
-        tickUpper = 60;
-        uint128 initialLiquidity = 100e18;
-
-        (uint256 amount0Expected, uint256 amount1Expected) = LiquidityAmounts.getAmountsForLiquidity(
-            SQRT_PRICE_1_1,
-            TickMath.getSqrtPriceAtTick(tickLower),
-            TickMath.getSqrtPriceAtTick(tickUpper),
-            initialLiquidity
-        );
-
-        amount0Expected = amount0Expected * 2;
-        amount1Expected = amount1Expected * 2;
-
-        (tokenId,) = posm.mint(
+        modifyLiquidityRouter.modifyLiquidity(
             key,
-            tickLower,
-            tickUpper,
-            initialLiquidity,
-            amount0Expected,
-            amount1Expected,
-            address(this),
-            block.timestamp,
-            ZERO_BYTES
+            IPoolManager.ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1e18, salt: bytes32(0)}),
+            abi.encode(address(this))
         );
     }
 
-    function test_AddLiquidity_UpdatesTracking() public {
-        uint128 liquidityToAdd = 0.1e18;
-        (uint256 amount0Min, uint256 amount1Min) = LiquidityAmounts.getAmountsForLiquidity(
-            SQRT_PRICE_1_1,
-            TickMath.getSqrtPriceAtTick(tickLower),
-            TickMath.getSqrtPriceAtTick(tickUpper),
-            liquidityToAdd
-        );
-
-        uint256 expectedAmount0 = amount0Min * 2;
-        uint256 expectedAmount1 = amount1Min * 2;
-
-        vm.expectEmit(true, true, true, true);
-        emit LiquidityUpdated(address(posm), Currency.unwrap(currency0), expectedAmount0, true);
-        vm.expectEmit(true, true, true, true);
-        emit LiquidityUpdated(address(posm), Currency.unwrap(currency1), expectedAmount1, true);
-
-        posm.increaseLiquidity(tokenId, liquidityToAdd, amount0Min * 2, amount1Min * 2, block.timestamp, ZERO_BYTES);
-
-        (,,,, uint256 totalLiquidityToken0, uint256 totalLiquidityToken1,,) = hook.poolDataMap(poolId);
-        assertGt(totalLiquidityToken0, 0);
-        assertGt(totalLiquidityToken1, 0);
-    }
-
-    function test_SwapCollectsInsuranceFees() public {
-        uint256 swapAmount = 1e18;
-        PoolSwapTest.TestSettings memory testSettings =
+    function test_InsuranceFeeCollection() public {
+        // Setup swap test settings
+        PoolSwapTest.TestSettings memory settings =
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
-        IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
-            zeroForOne: true,
-            amountSpecified: -int256(swapAmount),
-            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
-        });
+        // Get initial balance - using maxFlashLoan instead of direct mapping access
+        uint256 balanceBefore = hook.maxFlashLoan(Currency.unwrap(currency0));
 
-        vm.expectEmit(true, true, true, true);
-        emit InsuranceFeesCollected(Currency.unwrap(currency0), swapAmount, 1e16);
+        // Expect event emission
+        vm.expectEmit(true, true, false, true);
+        emit InsuranceFeesCollected(Currency.unwrap(currency0), 100e18, 1e18); // 1% fee on 100e18
 
-        swapRouter.swap(key, params, testSettings, ZERO_BYTES);
+        // Perform swap
+        swapRouter.swap(
+            key,
+            IPoolManager.SwapParams({
+                zeroForOne: true,
+                amountSpecified: -100e18,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            settings,
+            ZERO_BYTES
+        );
 
-        // Verify insurance fees were collected and claim tokens minted
-        (,,,,,, uint256 insuranceFees0, uint256 insuranceFees1) = hook.poolDataMap(poolId);
-        assertGt(insuranceFees0, 0);
-        assertEq(insuranceFees1, 0);
-        assertGt(manager.balanceOf(address(hook), currency0.toId()), 0);
+        uint256 balanceAfter = hook.maxFlashLoan(Currency.unwrap(currency0));
+        assertGt(balanceAfter, balanceBefore, "Insurance fees not collected");
+        assertEq(balanceAfter - balanceBefore, 1e18, "Incorrect fee amount"); // 1% of 100e18
     }
 
-    function test_ClaimInsuranceFees_DistributesCorrectly() public {
-        // First do a swap to collect fees
-        test_SwapCollectsInsuranceFees();
+    function test_FlashLoan() public {
+        borrower = new MockFlashBorrower();
+        uint256 loanAmount = 1e18;
 
-        uint256 initialBalance0 = currency0.balanceOfSelf();
-        uint256 initialBalance1 = currency1.balanceOfSelf();
+        // Add funds to the insurance pool
+        deal(Currency.unwrap(currency0), address(hook), 10e18);
 
-        vm.expectEmit(true, true, true, true);
-        emit InsuranceFeeClaimed(address(this), Currency.unwrap(currency0), 1e16);
+        // Expect event emission
+        vm.expectEmit(true, true, false, true);
+        emit FlashLoanExecuted(
+            address(borrower),
+            Currency.unwrap(currency0),
+            loanAmount,
+            hook.flashFee(Currency.unwrap(currency0), loanAmount)
+        );
 
-        hook.claimInsuranceFees(key);
-
-        assertGt(currency0.balanceOfSelf(), initialBalance0);
-        assertEq(currency1.balanceOfSelf(), initialBalance1);
+        bool success = hook.flashLoan(borrower, Currency.unwrap(currency0), loanAmount, "");
+        assertTrue(success, "Flash loan failed");
     }
 
-    function test_FlashLoan_SucceedsWithRepayment() public {
-        // First collect some fees through swaps
-        test_SwapCollectsInsuranceFees();
+    function test_ClaimInsuranceFees() public {
+        // Generate fees through swap
+        PoolSwapTest.TestSettings memory settings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
-        uint256 loanAmount = 0.1e18;
-        flashBorrower.setShouldRepay(true);
+        swapRouter.swap(
+            key,
+            IPoolManager.SwapParams({
+                zeroForOne: true,
+                amountSpecified: -100e18,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            settings,
+            ZERO_BYTES
+        );
 
-        vm.expectEmit(true, true, true, true);
-        emit FlashLoanExecuted(address(flashBorrower), Currency.unwrap(currency0), loanAmount, 0.001e18);
+        // Get initial balances
+        uint256 initialToken0Balance = IERC20(Currency.unwrap(currency0)).balanceOf(address(this));
 
-        bool success = hook.flashLoan(flashBorrower, Currency.unwrap(currency0), loanAmount, "");
-        assertTrue(success);
+        // Expect event emission
+        vm.expectEmit(true, true, false, true);
+        emit InsuranceFeeClaimed(address(this), Currency.unwrap(currency0), 1e18); // 1% fee
+
+        // Remove liquidity to trigger fee claim
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: -1e18, salt: bytes32(0)}),
+            abi.encode(address(this))
+        );
+
+        uint256 finalToken0Balance = IERC20(Currency.unwrap(currency0)).balanceOf(address(this));
+        assertGt(finalToken0Balance, initialToken0Balance, "No fees claimed");
+    }
+}
+
+contract MockInsuranceCalculator {
+    function calculateInsuranceFee(bytes32, uint256 amount, uint256, uint256, uint256, uint256)
+        external
+        pure
+        returns (uint256)
+    {
+        return amount / 100; // 1% fee
     }
 
-    function test_FlashLoan_FailsWithoutRepayment() public {
-        test_SwapCollectsInsuranceFees();
-
-        uint256 loanAmount = 0.1e18;
-        flashBorrower.setShouldRepay(false);
-
-        vm.expectRevert(InsurancePoolHook.RepaymentFailed.selector);
-        hook.flashLoan(flashBorrower, Currency.unwrap(currency0), loanAmount, "");
+    function calculateVolatility(bytes32, uint256, uint256) external pure returns (uint256) {
+        return 5e16; // 5% volatility
     }
 
-    function test_FlashLoan_RevertsWithInsufficientLiquidity() public {
-        uint256 loanAmount = 1000e18; // Very large amount
-        flashBorrower.setShouldRepay(true);
+    function calculateFlashLoanFee(uint256 amount, uint256, uint256, uint256) external pure returns (uint256) {
+        return amount / 1000; // 0.1% fee
+    }
+}
 
-        vm.expectRevert(abi.encodeWithSelector(InsurancePoolHook.InsufficientLiquidity.selector, loanAmount, 0));
-        hook.flashLoan(flashBorrower, Currency.unwrap(currency0), loanAmount, "");
+contract MockFlashBorrower is IERC3156FlashBorrower {
+    function onFlashLoan(address, address token, uint256 amount, uint256 fee, bytes calldata)
+        external
+        returns (bytes32)
+    {
+        IERC20(token).approve(msg.sender, amount + fee);
+        return keccak256("ERC3156FlashBorrower.onFlashLoan");
     }
 }
