@@ -8,7 +8,6 @@
 4. [Dynamic Fees Algorithm](#dynamic-fees-algorithm)
 5. [Local Development Setup](#local-development-setup)
 6. [Running Tests](#running-tests)
-7. [Set it up Yourself](#set-it-up-yourself)
 
 ---
 
@@ -129,21 +128,3 @@ FlashLoanFee = LoanAmount × UtilizationMultiplier × LiquidityMultiplier × His
 3. **View Logs and Results**  
    The test output will show which tests passed or failed. Adjust parameters as needed for debugging or verbosity.
 
-## Set it up Yourself
-
-### Prerequisites
-
-- Foundry
-- Node.js & npm
-
-### Installation Steps
-
-1. Clone the repository.
-2. Run `make build-contracts` to install dependencies and build the contracts.
-3. In `operator` directory, run `pnpm install` to install dependencies for the operator.
-4. Run `make deploy-to-anvil` at the project root to set up a local environment with EigenLayer and Uniswap V4 contracts.
-5. Run `make start-anvil` to start a local Anvil testchain.
-6. In `operator`, run `pnpm dev` to start the operator.
-7. In `operator`, run `pnpm create-task <number_of_tasks>` to create tasks and inspect operator logs.
-
-By following these steps, you can develop, test, and iterate on the Dynamic LP Assurance Hook locally, verifying fee calculations, liquidity distributions, and IL compensations in a controlled and replicable environment.
