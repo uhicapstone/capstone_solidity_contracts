@@ -1,96 +1,112 @@
-# v4-template
-### **A template for writing Uniswap v4 Hooks 🦄**
+#  Dynamic LP Assurance Hook
 
-[`Use this Template`](https://github.com/uniswapfoundation/v4-template/generate)
-
-1. The example hook [Counter.sol](src/Counter.sol) demonstrates the `beforeSwap()` and `afterSwap()` hooks
-2. The test template [Counter.t.sol](test/Counter.t.sol) preconfigures the v4 pool manager, test tokens, and test liquidity.
-
-<details>
-<summary>Updating to v4-template:latest</summary>
-
-This template is actively maintained -- you can update the v4 dependencies, scripts, and helpers: 
-```bash
-git remote add template https://github.com/uniswapfoundation/v4-template
-git fetch template
-git merge template/main <BRANCH> --allow-unrelated-histories
-```
-
-</details>
+## Table of Contents
+1. [Introduction](#introduction)  
+2. [Key Features](#key-features)  
+3. [Technical Architecture](#technical-architecture)  
+4. [Dynamic Fees Algorithm](#dynamic-fees-algorithm)  
+5. [Set it up yourself](#Set-it-up-yourself)  
 
 ---
 
-### Check Forge Installation
-*Ensure that you have correctly installed Foundry (Forge) and that it's up to date. You can update Foundry by running:*
+## Introduction
 
-```
-foundryup
-```
-
-## Set up
-
-*requires [foundry](https://book.getfoundry.sh)*
-
-```
-forge install
-forge test
-```
-
-### Local Development (Anvil)
-
-Other than writing unit tests (recommended!), you can only deploy & test hooks on [anvil](https://book.getfoundry.sh/anvil/)
-
-```bash
-# start anvil, a local EVM chain
-anvil
-
-# in a new terminal
-forge script script/Anvil.s.sol \
-    --rpc-url http://localhost:8545 \
-    --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-    --broadcast
-```
-
-See [script/](script/) for hook deployment, pool creation, liquidity provision, and swapping.
+The **Dynamic LP Assurance Hook** is a Uniswap V4 hook designed to protect liquidity providers (LPs) by dynamically collecting insurance fees and enabling flash loan functionalities. It provides compensation for impermanent loss (IL) and utilizes dynamic algorithms to compute fair insurance and flash loan fees, ensuring optimal utilization of liquidity.
 
 ---
 
-<details>
-<summary><h2>Troubleshooting</h2></summary>
+## Key Features
 
+1. **Dynamic Insurance Fee**  
+   - Fees are dynamically calculated based on multiple factors, including price volatility, trade size, and pool liquidity 
+     using Stylus (https://github.com/uhicapstone/capstone_stylus_contracts) which implements computationally intensive 
+     calculations, ensuring low-cost and efficient execution.
+   - Provides liquidity providers with compensation for impermanent loss during liquidity withdrawal.  
 
+2. **Flash Loan Functionality**  
+   - Offers flash loans on idle liquidity by leveraging the clubbed liquidity across multiple pools.  
+   - Dynamically calculates flash loan fees based on pool utilization, liquidity, and trade parameters. 
 
-### *Permission Denied*
-
-When installing dependencies with `forge install`, Github may throw a `Permission Denied` error
-
-Typically caused by missing Github SSH keys, and can be resolved by following the steps [here](https://docs.github.com/en/github/authenticating-to-github/connecting-to-github-with-ssh) 
-
-Or [adding the keys to your ssh-agent](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/generating-a-new-ssh-key-and-adding-it-to-the-ssh-agent#adding-your-ssh-key-to-the-ssh-agent), if you have already uploaded SSH keys
-
-### Hook deployment failures
-
-Hook deployment failures are caused by incorrect flags or incorrect salt mining
-
-1. Verify the flags are in agreement:
-    * `getHookCalls()` returns the correct flags
-    * `flags` provided to `HookMiner.find(...)`
-2. Verify salt mining is correct:
-    * In **forge test**: the *deployer* for: `new Hook{salt: salt}(...)` and `HookMiner.find(deployer, ...)` are the same. This will be `address(this)`. If using `vm.prank`, the deployer will be the pranking address
-    * In **forge script**: the deployer must be the CREATE2 Proxy: `0x4e59b44847b379578588920cA78FbF26c0B4956C`
-        * If anvil does not have the CREATE2 deployer, your foundry may be out of date. You can update it with `foundryup`
-
-</details>
+3. **Efficient Fee Distribution**  
+   - Swap fees and flash loan fees are proportionally distributed among pools and liquidity providers using offchain computation through Brevis (https://github.com/uhicapstone/capstone_brevis_circuit).  
 
 ---
 
-Additional resources:
+## Technical Architecture
 
-[Uniswap v4 docs](https://docs.uniswap.org/contracts/v4/overview)
+1. **Swapping Process**  
+   - The `beforeSwap` function calls `calculateInsuranceFee` which calculates insurance fees dynamically through stylus contract for each swap.  
+   - Fees are taken using the ERC6909 token mechanism and added to the hook accounting in `poolDataMap` & `tokenDataMap` without transferring actual funds directly.
 
-[v4-periphery](https://github.com/uniswap/v4-periphery) contains advanced hook implementations that serve as a great reference
+2. **Flash Loan Execution**  
+   - The `flashLoan` function first calls `flashfee` which calculates flashloan fess through stylus contract. It then facilitates flash loans while ensuring repayment with fees.  
+   - Fees collected are distributed among pools proportionally, leveraging the pooled liquidity.
+     
+3.  **Liquidity Withdraw**  
+   - When LP withdraws liquidity it triggers `beforeRemoveLiquidity` which calls `_calculateClaimableFees` which calculates 
+     the claimable insurance fees for LP based on their IL and share of liquidity in the pool.  
+   - IL is calculated with the help of brevis.
 
-[v4-core](https://github.com/uniswap/v4-core)
+---
 
-[v4-by-example](https://v4-by-example.org)
+## Dynamic Fees Algorithm
+
+This is where the real magic happens, driving everything behind the scenes!<br/> 
+The dynamic fees for insurance and flash loans are computed using a combination of metrics to ensure fair and adaptive pricing. These computations are offloaded to a Stylus contract for efficiency.
+
+1. **Insurance Fee Calculation**  
+   - **Inputs**:
+     - Pool liquidity
+     - Price volatility
+     - Trade size
+   - **Formula**:
+     \[
+     \text{InsuranceFee} = \text{TradeSize} \times \text{VolatilityFactor} \times \left(\frac{\text{CurrentPrice}}{\text{PreviousPrice}}\right)
+     \]
+
+2. **Flash Loan Fee Calculation**  
+   - **Inputs**:
+     - Available liquidity
+     - Utilization rate
+   - **Formula**:
+     \[
+     \text{FlashLoanFee} = \text{LoanAmount} \times \text{UtilizationRateFactor} \times \text{LiquidityFactor}
+     \]
+
+3. **Impermanent Loss Compensation**  
+   - **Inputs**:
+     - LP's share of liquidity
+     - Price change
+   - **Formula**:
+     \[
+     \text{Compensation} = \text{LPShare} \times \text{PoolContribution} \times \left(1 - \sqrt{\frac{\text{NewPrice}}{\text{OldPrice}}}\right)
+     \]
+
+---
+
+## Set it up yourself
+
+
+ 1. **Prerequisites**
+
+Ensure you have the following installed on your system:
+
+- **[Foundry]**
+- **Node.js & npm**
+
+---
+
+ 2. **Installation**
+
+1. Clone the GitHub repository
+2. Run `make build-contracts` to install required dependencies and build the contracts
+3. Run `cd operator` and `pnpm install` to install dependencies for the operator
+4. Run `make deploy-to-anvil` from the root directory to set up a local anvil instance with EigenLayer and Uniswap v4 contracts deployed
+5. Run `make start-anvil` from the root directory to start anvil on one terminal
+6. Run `cd operator` and `pnpm dev` to start the operator in another terminal
+7. Run `cd operator` and `pnpm create-task <number of tasks>` to create tasks.
+
+Inspect the logs in the operator terminal to see the tasks being created and the balances being settled.
+
+
 
