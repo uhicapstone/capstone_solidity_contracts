@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+// SPDX-License-Identifier: MIT-OR-APACHE-2.0
+pragma solidity ^0.8.23;
 
 interface IInsuranceCalculator {
     function calculateInsuranceFee(
@@ -9,11 +9,7 @@ interface IInsuranceCalculator {
         uint256 total_volume,
         uint256 current_price,
         uint256 timestamp
-    ) external returns (uint256);
-
-    function calculateVolatility(bytes32 pool_id, uint256 current_price, uint256 timestamp)
-        external
-        returns (uint256);
+    ) external view returns (uint256);
 
     function calculateFlashLoanFee(
         uint256 amount,

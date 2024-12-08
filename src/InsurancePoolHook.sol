@@ -173,10 +173,8 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         IPoolManager.ModifyLiquidityParams calldata params,
         bytes calldata hookData
     ) external virtual override returns (bytes4) {
-        // Decode the liquidity provider's address from hookData
         address liquidityProvider = abi.decode(hookData, (address));
 
-        // Get the PoolId from PoolKey
         PoolId poolId = key.toId();
         PoolData storage poolData = poolDataMap[poolId];
 
@@ -184,7 +182,6 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         (uint256 fees0, uint256 fees1) = _calculateClaimableFees(poolData, poolId, params, liquidityProvider);
         if (fees0 == 0 && fees1 == 0) revert NoFeesToClaim();
 
-        // Update accounting before transferring fees
         if (fees0 > 0) {
             poolData.totalContributionsToken0 -= fees0;
             tokenDataMap[poolData.token0].totalFunds -= fees0;
@@ -214,17 +211,22 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         IPoolManager.ModifyLiquidityParams calldata params,
         address liquidityProvider
     ) internal view returns (uint256 fees0, uint256 fees1) {
-        // Fetch position info for the user
+        // Get total liquidity from the pool
+        uint128 totalLiquidity = poolManager.getLiquidity(poolId);
+        if (totalLiquidity == 0) return (0, 0);
+
+        // Get the user's liquidity position
         (uint128 userLiquidity,,) =
             poolManager.getPositionInfo(poolId, liquidityProvider, params.tickLower, params.tickUpper, params.salt);
 
-        // Fetch total liquidity from PoolManager
-        uint128 totalLiquidity = poolManager.getLiquidity(poolId);
-
-        if (totalLiquidity > 0) {
-            // Calculate claimable fees proportionally to user's liquidity
+        if (userLiquidity > 0) {
+            // Calculate proportional fees
             fees0 = (poolData.totalContributionsToken0 * userLiquidity) / totalLiquidity;
             fees1 = (poolData.totalContributionsToken1 * userLiquidity) / totalLiquidity;
+
+            // Ensure we don't claim more than available
+            fees0 = fees0 > poolData.totalContributionsToken0 ? poolData.totalContributionsToken0 : fees0;
+            fees1 = fees1 > poolData.totalContributionsToken1 ? poolData.totalContributionsToken1 : fees1;
         }
     }
 
@@ -243,8 +245,14 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         FlashLoanCallback memory callback =
             FlashLoanCallback({receiver: receiver, token: token, amount: amount, fee: fee, data: data});
 
+        // Update accounting BEFORE the flash loan
+        tokenDataRef.totalFunds -= amount;
+
         // Unlock the pool manager and execute the flash loan
         poolManager.unlock(abi.encode(callback));
+
+        // Update accounting AFTER the flash loan
+        tokenDataRef.totalFunds += amount + fee;
 
         return true;
     }
@@ -260,27 +268,10 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
     function _unlockCallback(bytes calldata data) internal override returns (bytes memory) {
         FlashLoanCallback memory callback = abi.decode(data, (FlashLoanCallback));
 
-        TokenData storage tokenDataRef = tokenDataMap[callback.token];
         Currency tokenCurrency = Currency.wrap(callback.token);
 
-        // Update accounting before transfer
-        tokenDataRef.totalFunds -= callback.amount;
-
-        // First create a debit for the borrower with the Pool Manager
-        tokenCurrency.settle(
-            poolManager,
-            address(callback.receiver),
-            callback.amount,
-            false // false = transfer tokens, not burn claim tokens
-        );
-
-        // Then take claim tokens for the amount we just debited
-        tokenCurrency.take(
-            poolManager,
-            address(callback.receiver),
-            callback.amount,
-            true // true = mint claim tokens
-        );
+        // First transfer the flash loan amount to the borrower
+        tokenCurrency.settle(poolManager, address(callback.receiver), callback.amount, false);
 
         // Execute callback
         bytes32 callbackResult =
@@ -290,24 +281,10 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         // Take repayment with fee
         uint256 repayment = callback.amount + callback.fee;
 
-        // Create a debit for us with the Pool Manager using the repayment from borrower
-        tokenCurrency.settle(
-            poolManager,
-            address(this),
-            repayment,
-            false // false = transfer tokens, not burn claim tokens
-        );
+        // Take the repayment amount from the borrower
+        tokenCurrency.take(poolManager, address(this), repayment, true);
 
-        // Take claim tokens for the repayment amount
-        tokenCurrency.take(
-            poolManager,
-            address(this),
-            repayment,
-            true // true = mint claim tokens
-        );
-
-        // Update accounting and distribute fees
-        tokenDataRef.totalFunds += repayment;
+        // Distribute flash loan fees
         distributeFlashLoanFees(callback.token, callback.fee);
 
         emit FlashLoanExecuted(address(callback.receiver), callback.token, callback.amount, callback.fee);
