@@ -1,30 +1,25 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.20;
 
 import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
-import {Hooks} from "v4-core/src/libraries/Hooks.sol";
-import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
-import {PoolKey} from "v4-core/src/types/PoolKey.sol";
-import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
-import {CurrencySettler} from "v4-core/test/utils/CurrencySettler.sol";
-import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
-import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
-import {FixedPointMathLib} from "lib/v4-core/lib/solmate/src/utils/FixedPointMathLib.sol";
-import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
-import {TickMath} from "v4-core/src/libraries/TickMath.sol";
-import {Slot0} from "v4-core/src/types/Slot0.sol";
+import {CurrencySettler} from "v4-core/test/utils/CurrencySettler.sol";
+import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+import {BeforeSwapDelta, toBeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {Slot0} from "@uniswap/v4-core/src/types/Slot0.sol";
 import {IInsuranceCalculator} from "./interfaces/IInsuranceCalculator.sol";
 import "@openzeppelin/contracts/interfaces/IERC3156FlashLender.sol";
 import "@openzeppelin/contracts/interfaces/IERC3156FlashBorrower.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 
-/**
- * @title InsurancePoolHook
- * @notice A Uniswap V4 hook that provides insurance and flash loan capabilities
- * @dev Implements insurance fee collection and flash loan functionality
- */
 contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
@@ -32,31 +27,29 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
     using FixedPointMathLib for uint256;
     using StateLibrary for IPoolManager;
 
-    // Immutable state variables
     IInsuranceCalculator public immutable insuranceCalculator;
     bytes32 public constant CALLBACK_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
+    uint256 private constant Q96 = 1 << 96;
 
     // Custom errors
     error UnsupportedToken(address token);
     error CallbackFailed(address borrower);
-    error RepaymentFailed(address token, address from, uint256 amount);
-    error InsufficientLiquidity(uint256 requested, uint256 available);
     error InvalidAmount();
     error NoFeesToClaim();
-    error TransferFailed();
-    error Unauthorized();
+    error InsufficientLiquidity();
+    error NotImplemented();
 
-    // Events
-    event InsuranceFeesCollected(address indexed token, uint256 amount, uint256 fee);
+    event InsuranceFeesCollected(address indexed token, uint256 swapAmount, uint256 fee);
     event InsuranceFeeClaimed(address indexed user, address indexed token, uint256 amount);
     event FlashLoanExecuted(address indexed borrower, address indexed token, uint256 amount, uint256 fee);
-    event LiquidityUpdated(address indexed user, address indexed token, uint256 amount, bool isAdd);
 
     struct PoolData {
         address token0;
         address token1;
         uint256 totalContributionsToken0;
         uint256 totalContributionsToken1;
+        uint256 feeGrowthGlobal0;
+        uint256 feeGrowthGlobal1;
     }
 
     struct TokenData {
@@ -64,13 +57,18 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         mapping(PoolId => uint256) poolContributions;
     }
 
-    // State variables
+    struct PositionData {
+        uint256 feeGrowthInsideLast0;
+        uint256 feeGrowthInsideLast1;
+    }
+
     mapping(PoolId => PoolData) public poolDataMap;
     mapping(address => TokenData) public tokenDataMap;
     PoolId[] public poolList;
+    mapping(bytes32 => PositionData) public positionDataMap;
 
     constructor(IPoolManager _poolManager, address _calculator) BaseHook(_poolManager) {
-        if (_calculator == address(0)) revert Unauthorized();
+        require(_calculator != address(0), "Invalid calculator");
         insuranceCalculator = IInsuranceCalculator(_calculator);
     }
 
@@ -78,7 +76,7 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         return Hooks.Permissions({
             beforeInitialize: false,
             afterInitialize: true,
-            beforeAddLiquidity: false,
+            beforeAddLiquidity: true,
             afterAddLiquidity: false,
             beforeRemoveLiquidity: true,
             afterRemoveLiquidity: false,
@@ -96,12 +94,99 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
     function afterInitialize(address, PoolKey calldata key, uint160, int24) external override returns (bytes4) {
         PoolId poolId = key.toId();
         poolList.push(poolId);
-        // Initialize pool data
         PoolData storage poolData = poolDataMap[poolId];
         poolData.token0 = Currency.unwrap(key.currency0);
         poolData.token1 = Currency.unwrap(key.currency1);
 
         return BaseHook.afterInitialize.selector;
+    }
+
+    function beforeAddLiquidity(
+        address,
+        PoolKey calldata key,
+        IPoolManager.ModifyLiquidityParams calldata params,
+        bytes calldata hookData
+    ) external override returns (bytes4) {
+        address user = abi.decode(hookData, (address));
+        PoolId poolId = key.toId();
+        PoolData storage pData = poolDataMap[poolId];
+
+        if (params.liquidityDelta > 0) {
+            bytes32 posKey = _positionKey(poolId, user, params);
+            PositionData storage pos = positionDataMap[posKey];
+            pos.feeGrowthInsideLast0 = pData.feeGrowthGlobal0;
+            pos.feeGrowthInsideLast1 = pData.feeGrowthGlobal1;
+        }
+        return BaseHook.beforeAddLiquidity.selector;
+    }
+
+    function beforeRemoveLiquidity(
+        address,
+        PoolKey calldata key,
+        IPoolManager.ModifyLiquidityParams calldata params,
+        bytes calldata hookData
+    ) external override returns (bytes4) {
+        address liquidityProvider = abi.decode(hookData, (address));
+        if (params.liquidityDelta >= 0) return BaseHook.beforeRemoveLiquidity.selector;
+
+        PoolId poolId = key.toId();
+        PoolData storage poolData = poolDataMap[poolId];
+
+        (uint128 userLiquidity,,) =
+            poolManager.getPositionInfo(poolId, liquidityProvider, params.tickLower, params.tickUpper, params.salt);
+        if (userLiquidity == 0) return BaseHook.beforeRemoveLiquidity.selector;
+
+        uint128 liquidityToRemove = uint128(uint256(-params.liquidityDelta));
+        if (liquidityToRemove > userLiquidity) {
+            liquidityToRemove = userLiquidity;
+        }
+
+        bytes32 posKey = _positionKey(poolId, liquidityProvider, params);
+        PositionData storage pos = positionDataMap[posKey];
+
+        uint256 feeGrowthGlobal0 = poolData.feeGrowthGlobal0;
+        uint256 feeGrowthGlobal1 = poolData.feeGrowthGlobal1;
+
+        uint256 owed0 = ((feeGrowthGlobal0 - pos.feeGrowthInsideLast0) * liquidityToRemove) / Q96;
+        uint256 owed1 = ((feeGrowthGlobal1 - pos.feeGrowthInsideLast1) * liquidityToRemove) / Q96;
+
+        if (owed0 == 0 && owed1 == 0) {
+            return BaseHook.beforeRemoveLiquidity.selector;
+        }
+
+        if (owed0 > 0) {
+            TokenData storage tData0 = tokenDataMap[poolData.token0];
+            if (tData0.totalFunds < owed0) revert InsufficientLiquidity();
+            tData0.totalFunds -= owed0;
+            poolData.totalContributionsToken0 =
+                (poolData.totalContributionsToken0 > owed0) ? poolData.totalContributionsToken0 - owed0 : 0;
+
+            Currency c0 = Currency.wrap(poolData.token0);
+            c0.settle(poolManager, liquidityProvider, owed0, false);
+            emit InsuranceFeeClaimed(liquidityProvider, poolData.token0, owed0);
+        }
+
+        if (owed1 > 0) {
+            TokenData storage tData1 = tokenDataMap[poolData.token1];
+            if (tData1.totalFunds < owed1) revert InsufficientLiquidity();
+            tData1.totalFunds -= owed1;
+            poolData.totalContributionsToken1 =
+                (poolData.totalContributionsToken1 > owed1) ? poolData.totalContributionsToken1 - owed1 : 0;
+
+            Currency c1 = Currency.wrap(poolData.token1);
+            c1.settle(poolManager, liquidityProvider, owed1, false);
+            emit InsuranceFeeClaimed(liquidityProvider, poolData.token1, owed1);
+        }
+
+        uint128 newLiquidity = userLiquidity - liquidityToRemove;
+        if (newLiquidity > 0) {
+            pos.feeGrowthInsideLast0 = feeGrowthGlobal0;
+            pos.feeGrowthInsideLast1 = feeGrowthGlobal1;
+        } else {
+            delete positionDataMap[posKey];
+        }
+
+        return BaseHook.beforeRemoveLiquidity.selector;
     }
 
     function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
@@ -111,20 +196,14 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
     {
         if (params.amountSpecified == 0) revert InvalidAmount();
 
-        // Get PoolId from PoolKey
         PoolId poolId = key.toId();
         PoolData storage poolData = poolDataMap[poolId];
 
         uint256 amount = params.zeroForOne ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
-
-        // Retrieve total liquidity using `getLiquidity` from PoolManager(statelibrary)
         uint256 totalLiquidity = poolManager.getLiquidity(poolId);
-
-        // Fetch the current price from poolmanager
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolId);
         uint256 currentPrice = uint256(sqrtPriceX96) * uint256(sqrtPriceX96) * 1e18 >> (96 * 2);
 
-        // Calculate insurance fee
         uint256 insuranceFee = insuranceCalculator.calculateInsuranceFee(
             PoolId.unwrap(poolId),
             amount,
@@ -134,102 +213,41 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
             block.timestamp
         );
 
-        // Determine input currency
-        Currency inputCurrency = params.zeroForOne ? key.currency0 : key.currency1;
+        if (insuranceFee > 0) {
+            Currency inputCurrency = params.zeroForOne ? key.currency0 : key.currency1;
+            inputCurrency.take(poolManager, address(this), insuranceFee, true);
 
-        // Take insurance fees from user and give claim tokens to hook
-        inputCurrency.take(poolManager, address(this), insuranceFee, true);
+            _updateInsuranceFees(poolData, params.zeroForOne, poolId, insuranceFee);
 
-        // Update insurance fees and pool data
-        _updateInsuranceFees(poolData, params.zeroForOne, poolId, insuranceFee);
+            if (totalLiquidity > 0) {
+                if (params.zeroForOne) {
+                    poolData.feeGrowthGlobal0 += (insuranceFee * Q96) / totalLiquidity;
+                } else {
+                    poolData.feeGrowthGlobal1 += (insuranceFee * Q96) / totalLiquidity;
+                }
+            }
 
-        // Emit insurance fee collection event
-        emit InsuranceFeesCollected(
-            params.zeroForOne ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1), amount, insuranceFee
-        );
+            emit InsuranceFeesCollected(params.zeroForOne ? poolData.token0 : poolData.token1, amount, insuranceFee);
+        }
 
-        // Return the required hook response
         return (BaseHook.beforeSwap.selector, toBeforeSwapDelta(int128(int256(insuranceFee)), 0), 0);
     }
 
     function _updateInsuranceFees(PoolData storage poolData, bool zeroForOne, PoolId poolId, uint256 fee) internal {
-        // First update the pool-specific contributions
+        address token = zeroForOne ? poolData.token0 : poolData.token1;
+        TokenData storage tData = tokenDataMap[token];
+
         if (zeroForOne) {
             poolData.totalContributionsToken0 += fee;
-            tokenDataMap[poolData.token0].poolContributions[poolId] += fee;
-            // Update total funds after pool contributions
-            tokenDataMap[poolData.token0].totalFunds += fee;
+            tData.poolContributions[poolId] += fee;
         } else {
             poolData.totalContributionsToken1 += fee;
-            tokenDataMap[poolData.token1].poolContributions[poolId] += fee;
-            // Update total funds after pool contributions
-            tokenDataMap[poolData.token1].totalFunds += fee;
+            tData.poolContributions[poolId] += fee;
         }
+        tData.totalFunds += fee;
     }
 
-    function beforeRemoveLiquidity(
-        address,
-        PoolKey calldata key,
-        IPoolManager.ModifyLiquidityParams calldata params,
-        bytes calldata hookData
-    ) external virtual override returns (bytes4) {
-        address liquidityProvider = abi.decode(hookData, (address));
-
-        PoolId poolId = key.toId();
-        PoolData storage poolData = poolDataMap[poolId];
-
-        // Calculate claimable fees based on user's liquidity
-        (uint256 fees0, uint256 fees1) = _calculateClaimableFees(poolData, poolId, params, liquidityProvider);
-        if (fees0 == 0 && fees1 == 0) revert NoFeesToClaim();
-
-        if (fees0 > 0) {
-            poolData.totalContributionsToken0 -= fees0;
-            tokenDataMap[poolData.token0].totalFunds -= fees0;
-            tokenDataMap[poolData.token0].poolContributions[poolId] -= fees0;
-
-            // Transfer fees to the liquidity provider
-            key.currency0.settle(poolManager, liquidityProvider, fees0, false);
-            emit InsuranceFeeClaimed(liquidityProvider, poolData.token0, fees0);
-        }
-
-        if (fees1 > 0) {
-            poolData.totalContributionsToken1 -= fees1;
-            tokenDataMap[poolData.token1].totalFunds -= fees1;
-            tokenDataMap[poolData.token1].poolContributions[poolId] -= fees1;
-
-            // Transfer fees to the liquidity provider
-            key.currency1.settle(poolManager, liquidityProvider, fees1, false);
-            emit InsuranceFeeClaimed(liquidityProvider, poolData.token1, fees1);
-        }
-
-        return BaseHook.beforeRemoveLiquidity.selector;
-    }
-
-    function _calculateClaimableFees(
-        PoolData storage poolData,
-        PoolId poolId,
-        IPoolManager.ModifyLiquidityParams calldata params,
-        address liquidityProvider
-    ) internal view returns (uint256 fees0, uint256 fees1) {
-        // Get total liquidity from the pool
-        uint128 totalLiquidity = poolManager.getLiquidity(poolId);
-        if (totalLiquidity == 0) return (0, 0);
-
-        // Get the user's liquidity position
-        (uint128 userLiquidity,,) =
-            poolManager.getPositionInfo(poolId, liquidityProvider, params.tickLower, params.tickUpper, params.salt);
-
-        if (userLiquidity > 0) {
-            // Calculate proportional fees
-            fees0 = (poolData.totalContributionsToken0 * userLiquidity) / totalLiquidity;
-            fees1 = (poolData.totalContributionsToken1 * userLiquidity) / totalLiquidity;
-
-            // Ensure we don't claim more than available
-            fees0 = fees0 > poolData.totalContributionsToken0 ? poolData.totalContributionsToken0 : fees0;
-            fees1 = fees1 > poolData.totalContributionsToken1 ? poolData.totalContributionsToken1 : fees1;
-        }
-    }
-
+    // Flash loan logic
     function flashLoan(IERC3156FlashBorrower receiver, address token, uint256 amount, bytes calldata data)
         external
         override
@@ -237,22 +255,16 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
         returns (bool)
     {
         TokenData storage tokenDataRef = tokenDataMap[token];
-        if (tokenDataRef.totalFunds < amount) revert InsufficientLiquidity(amount, tokenDataRef.totalFunds);
+        if (tokenDataRef.totalFunds < amount) revert InsufficientLiquidity();
 
         uint256 fee = flashFee(token, amount);
 
-        // Create a callback struct for the unlock
         FlashLoanCallback memory callback =
             FlashLoanCallback({receiver: receiver, token: token, amount: amount, fee: fee, data: data});
 
-        // Update accounting BEFORE the flash loan
         tokenDataRef.totalFunds -= amount;
-
-        // Unlock the pool manager and execute the flash loan
         poolManager.unlock(abi.encode(callback));
-
-        // Update accounting AFTER the flash loan
-        tokenDataRef.totalFunds += amount + fee;
+        // After loan is returned, totalFunds get updated in _unlockCallback when repayment happens
 
         return true;
     }
@@ -267,73 +279,74 @@ contract InsurancePoolHook is BaseHook, IERC3156FlashLender, ReentrancyGuard {
 
     function _unlockCallback(bytes calldata data) internal override returns (bytes memory) {
         FlashLoanCallback memory callback = abi.decode(data, (FlashLoanCallback));
-
         Currency tokenCurrency = Currency.wrap(callback.token);
 
-        // First transfer the flash loan amount to the borrower
-        tokenCurrency.settle(poolManager, address(callback.receiver), callback.amount, false);
+        tokenCurrency.settle(poolManager, address(this), callback.amount, true);
+        tokenCurrency.take(poolManager, address(callback.receiver), callback.amount, false);
 
-        // Execute callback
         bytes32 callbackResult =
             callback.receiver.onFlashLoan(msg.sender, callback.token, callback.amount, callback.fee, callback.data);
         if (callbackResult != CALLBACK_SUCCESS) revert CallbackFailed(address(callback.receiver));
 
-        // Take repayment with fee
         uint256 repayment = callback.amount + callback.fee;
-
-        // Take the repayment amount from the borrower
+        tokenCurrency.settle(poolManager, address(callback.receiver), repayment, false);
         tokenCurrency.take(poolManager, address(this), repayment, true);
 
-        // Distribute flash loan fees
-        distributeFlashLoanFees(callback.token, callback.fee);
+        uint256 feeAmount = callback.fee;
+        tokenDataMap[callback.token].totalFunds += repayment;
+        distributeFlashLoanFees(callback.token, feeAmount);
 
         emit FlashLoanExecuted(address(callback.receiver), callback.token, callback.amount, callback.fee);
-
         return "";
     }
 
     function distributeFlashLoanFees(address token, uint256 feeAmount) internal {
         TokenData storage tokenData = tokenDataMap[token];
-        require(tokenData.totalFunds > 0, "No token funds to distribute");
 
-        uint256 totalDistributed = 0;
-        // Distribute fees proportionally to each pool based on their contributions
         for (uint256 i = 0; i < poolList.length; i++) {
-            PoolId poolId = poolList[i];
-            uint256 poolContribution = tokenData.poolContributions[poolId];
+            PoolId pid = poolList[i];
+            uint256 poolContribution = tokenData.poolContributions[pid];
             if (poolContribution == 0) continue;
 
-            // Calculate this pool's share of the fee
             uint256 distributedFee = (feeAmount * poolContribution) / tokenData.totalFunds;
             if (distributedFee == 0) continue;
 
-            totalDistributed += distributedFee;
+            PoolData storage pData = poolDataMap[pid];
 
-            // Update pool-specific accounting
-            PoolData storage poolData = poolDataMap[poolId];
-            if (token == poolData.token0) {
-                poolData.totalContributionsToken0 += distributedFee;
-                tokenData.poolContributions[poolId] += distributedFee;
-            } else if (token == poolData.token1) {
-                poolData.totalContributionsToken1 += distributedFee;
-                tokenData.poolContributions[poolId] += distributedFee;
+            if (token == pData.token0) {
+                pData.totalContributionsToken0 += distributedFee;
+            } else if (token == pData.token1) {
+                pData.totalContributionsToken1 += distributedFee;
+            }
+
+            uint256 totalLiquidity = poolManager.getLiquidity(pid);
+            if (totalLiquidity > 0) {
+                if (token == pData.token0) {
+                    pData.feeGrowthGlobal0 += (distributedFee * Q96) / totalLiquidity;
+                } else {
+                    pData.feeGrowthGlobal1 += (distributedFee * Q96) / totalLiquidity;
+                }
             }
         }
-
-        // Update total funds after all distributions
-        tokenData.totalFunds += feeAmount;
     }
 
     function flashFee(address token, uint256 amount) public view override returns (uint256) {
         TokenData storage tokenDataRef = tokenDataMap[token];
         if (tokenDataRef.totalFunds == 0) revert UnsupportedToken(token);
 
-        uint256 utilizationRate = tokenDataRef.totalFunds > 0 ? (amount * 1e18) / tokenDataRef.totalFunds : 0;
-
+        uint256 utilizationRate = (amount * 1e18) / tokenDataRef.totalFunds;
         return insuranceCalculator.calculateFlashLoanFee(amount, tokenDataRef.totalFunds, utilizationRate, 0);
     }
 
     function maxFlashLoan(address token) external view override returns (uint256) {
         return tokenDataMap[token].totalFunds;
+    }
+
+    function _positionKey(PoolId pid, address owner, IPoolManager.ModifyLiquidityParams calldata params)
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(pid, owner, params.tickLower, params.tickUpper, params.salt));
     }
 }
