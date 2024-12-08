@@ -59,6 +59,7 @@ The **Dynamic LP Assurance Hook** is an advanced Uniswap V4 hook designed to pro
 ---
 
 ## Dynamic Fees Algorithm
+This is implemented in the **Arbitrum Stylus Contract** [Stylus Repository](https://github.com/uhicapstone/capstone_stylus_contracts).
 
 ### Insurance Fee Calculation
 
