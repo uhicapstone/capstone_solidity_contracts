@@ -33,7 +33,6 @@ The **Dynamic LP Assurance Hook** is an advanced Uniswap V4 hook designed to pro
 
 3. **Efficient Fee Distribution**
    - Distributes insurance and flash loan fees proportionally among LPs based on pool contributions.
-   - Leverages off-chain computation (e.g., Brevis circuits) for accurate and fair distributions.
 
 ---
 
@@ -54,7 +53,6 @@ The **Dynamic LP Assurance Hook** is an advanced Uniswap V4 hook designed to pro
 ### Liquidity Withdrawals
 
 - The `beforeRemoveLiquidity` function calculates IL compensation for the withdrawing LP.
-- Utilizes Brevis circuits to determine LP's share and compensation accurately.
 
 ---
 
